@@ -52,14 +52,6 @@ related to program flow, registers, stacks, and memory:
 - the full arithmetic and type system (i8..u64, f32/f64, correct overflow/truncation)
 - `print` (writes to the log exactly as on the real VM)
 
-Instructions related to surrounding hardware — sound (`beep`/`sound`),
-graphics (`xframe`, `xpix`, ...), text mode (`xt*`), input (`xi*`/`xit*`), and
-the virtual disk (`fs*`/SVFS) — **are not emulated**. The debugger simply
-"skips" them (consumes the operands and, where relevant, zeroes the output
-registers to a safe value) and writes `[SKIP] ...` to the log, so it's clear
-that nothing real happened there. This is intentional — this is a debugger
-for program flow/stack/memory, not a display emulator.
-
 `vmx` (dynamically loading new code from RAM) is also not supported — it
 falls outside the scope of the statically disassembled code segment that the
 debugger displays; the instruction is simply skipped with a note in the log.
