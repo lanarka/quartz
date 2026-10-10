@@ -1,0 +1,149 @@
+// ============================================================================
+// hello.quartz - a small square bouncing off the edges of the screen (640x480).
+// Pressing any key OR mouse button changes the square's color
+// (to a new random color, edge-triggered - not every frame while held).
+// ============================================================================
+//
+// box_w/box_h (old #10/#11) are now just inlined as literals at the one
+// xframe call site that needs them, which frees #10/#11 up permanently for
+// bus scratch use.
+%include "std.quartz"
+
+// register map:
+// #0  x            (i32, current position)
+// #1  y            (i32)
+// #2  dirx         (0 = right, 1 = left)
+// #3  diry         (0 = down,  1 = up)
+// #4  color        (u32, current square color, packed ABGR)
+// #5  prev_input   (0/1, "is something pressed" state from the previous frame -
+//                   for edge detection, so the color changes only once per press)
+// #6-#9            scratch (temporary, no persistent meaning across frames)
+// #10 bus_dev      (device id, reloaded before each bus call)
+// #11 bus_port     (port/command id, reloaded before each bus call)
+// #12 fb_addr      (0x2000, RAM address where the square's pixel buffer is stored)
+// #13 speed        (4 px/frame, constant)
+// #14 bound_x      (620 = 640 - box_w, constant)
+// #15 bound_y      (460 = 480 - box_h, constant)
+
+	movi u32 #12 0x2000
+	movi i32 #13 4
+	movi i32 #14 620
+	movi i32 #15 460
+
+	movi i32 #0 100
+	movi i32 #1 80
+	movi i32 #2 0
+	movi i32 #3 0
+	movi u32 #4 0xFFFFFF00   // starting color = opaque cyan (R=0,G=255,B=255,A=255)
+	movi u32 #5 0
+
+	call fill_box            // fill pixel buffer #12 with the starting color
+
+// mouse reads pixel coordinates for the whole run - stage that once
+	movi u32 #10 $std.BUS_DEV_MOUSE
+	movi u32 #11 $std.MOUSE_PORT_MODE
+	movi u32 #6 0
+	busout #10 #11 #6
+
+main_loop:
+	
+	movi u32 #10 $std.BUS_DEV_VIDEO
+	movi u32 #11 $std.VIDEO_CMD_CLEAR
+	busout #10 #11 #6
+
+	
+	movi u32 #11 $std.VIDEO_PORT_X
+	busout #10 #11 #0
+	movi u32 #11 $std.VIDEO_PORT_Y
+	busout #10 #11 #1
+	movi u16 #7 20
+	movi u32 #11 $std.VIDEO_PORT_W
+	busout #10 #11 #7
+	movi u16 #7 20
+	movi u32 #11 $std.VIDEO_PORT_H
+	busout #10 #11 #7
+	movi u32 #11 $std.VIDEO_CMD_FRAME
+	movi u32 #8 1600            // len = box_w * box_h * 4 = 20*20*4
+	busoutb #10 #11 #12 #8 #6
+
+	movi u32 #11 $std.VIDEO_CMD_VSYNC
+	busout #10 #11 #6
+
+	// input: any key OR mouse -> edge-triggered color change
+	movi u32 #10 $std.BUS_DEV_MOUSE
+	movi u32 #11 $std.MOUSE_PORT_X
+	busin #10 #11 #6
+	movi u32 #11 $std.MOUSE_PORT_Y
+	busin #10 #11 #7
+	movi u32 #11 $std.MOUSE_PORT_BUTTONS
+	busin #10 #11 #8
+
+	movi u32 #7 0x3000       // #7 = temporary RAM address for xikey (mouse my no longer needed)
+	movi u32 #10 $std.BUS_DEV_KEYBOARD
+	movi u32 #11 $std.KBD_PORT_POLL
+	movi u32 #9 8             // len = 8 (aliases with dst below - read before write is safe)
+	businb #10 #11 #7 #9 #9   // #9 = number of currently held keys
+	or   u32 #8 #9           // #8 = (mouse_btn | key_count), nonzero = "something is pressed"
+
+	cmpi u32 #8 0
+	jz no_input
+	cmpi u32 #5 0
+	jnz already_pressed
+	rnd  #4 0x00ffffff       // new random color (R,G,B at once)
+	addi u32 #4 0xff000000   // set the alpha channel to full opacity
+	call fill_box            // redraw the buffer with the new color
+already_pressed:
+	movi u32 #5 1
+	jmp input_done
+no_input:
+	movi u32 #5 0
+input_done:
+
+	// X movement
+	cmpi i32 #2 0
+	jnz move_x_left
+	add  i32 #0 #13
+	cmp  i32 #0 #14
+	jl   move_x_done
+	mov  #0 #14
+	movi i32 #2 1
+	jmp move_x_done
+move_x_left:
+	sub  i32 #0 #13
+	cmpi i32 #0 0
+	jg   move_x_done
+	movi i32 #0 0
+	movi i32 #2 0
+move_x_done:
+
+	// Y movement
+	cmpi i32 #3 0
+	jnz move_y_up
+	add  i32 #1 #13
+	cmp  i32 #1 #15
+	jl   move_y_done
+	mov  #1 #15
+	movi i32 #3 1
+	jmp move_y_done
+move_y_up:
+	sub  i32 #1 #13
+	cmpi i32 #1 0
+	jg   move_y_done
+	movi i32 #1 0
+	movi i32 #3 0
+move_y_done:
+
+	jmp main_loop
+
+// fill_box: fills box_w*box_h (20*20) pixels at address fb_addr(#12) with
+// color #4. Uses #6 (running address) and #7 (counter) as temporary registers.
+fill_box:
+	mov  #7 #12
+	movi u32 #6 400          // box_w * box_h = 20*20 = 400 pixels
+fill_box_loop:
+	storer u32 #7 #4
+	addi   u32 #7 4
+	subi   u32 #6 1
+	cmpi   u32 #6 0
+	jnz fill_box_loop
+	ret

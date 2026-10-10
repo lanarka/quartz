@@ -1,0 +1,77 @@
+// A B G R
+
+%include "std.quartz"
+
+// register map:
+// #0  x/col     (text-grid column - also receives the mouse column each frame)
+// #1  y/row     (text-grid row - also receives the mouse row each frame)
+// #2  cp        (codepoint to draw)
+// #3  fg        (foreground color)
+// #4  bg        (background color)
+// #9  mouse_btn (from the mouse device, unused)
+// #13 bus_dev   (device id, reloaded before each bus call)
+// #14 bus_port  (port/command id, reloaded before each bus call)
+// #15 bus_val   (OUT payload / ignored placeholder)
+
+// text-mode mouse coordinates for the whole run - stage that once
+	movi u32 #13 $std.BUS_DEV_MOUSE
+	movi u32 #14 $std.MOUSE_PORT_MODE
+	movi u32 #15 1
+	busout #13 #14 #15
+
+loop:
+
+	movi u16 #0 1
+	movi u16 #1 2
+	movi u16 #2 65
+	movi u32 #3 0xFFFFFFFF
+	movi u32 #4 0xFF000000
+
+	movi u32 #13 $std.BUS_DEV_VIDEO_TEXT
+	movi u32 #14 $std.VTXT_PORT_X
+	busout #13 #14 #0
+	movi u32 #14 $std.VTXT_PORT_Y
+	busout #13 #14 #1
+	movi u32 #14 $std.VTXT_PORT_CODEPOINT
+	busout #13 #14 #2
+	movi u32 #14 $std.VTXT_PORT_FG
+	busout #13 #14 #3
+	movi u32 #14 $std.VTXT_PORT_BG
+	busout #13 #14 #4
+	movi u32 #14 $std.VTXT_CMD_CHAR
+	busout #13 #14 #15
+
+	movi u32 #13 $std.BUS_DEV_MOUSE
+	movi u32 #14 $std.MOUSE_PORT_X
+	busin  #13 #14 #0
+	movi u32 #14 $std.MOUSE_PORT_Y
+	busin  #13 #14 #1
+	movi u32 #14 $std.MOUSE_PORT_BUTTONS
+	busin  #13 #14 #9
+
+	movi u16 #2 9608
+	movi u32 #3 0x770000FF
+	movi u32 #4 0x770000FF
+
+	movi u32 #13 $std.BUS_DEV_VIDEO_TEXT
+	movi u32 #14 $std.VTXT_PORT_X
+	busout #13 #14 #0
+	movi u32 #14 $std.VTXT_PORT_Y
+	busout #13 #14 #1
+	movi u32 #14 $std.VTXT_PORT_CODEPOINT
+	busout #13 #14 #2
+	movi u32 #14 $std.VTXT_PORT_FG
+	busout #13 #14 #3
+	movi u32 #14 $std.VTXT_PORT_BG
+	busout #13 #14 #4
+	movi u32 #14 $std.VTXT_CMD_CHAR
+	busout #13 #14 #15
+
+	movi u32 #13 $std.BUS_DEV_VIDEO
+	movi u32 #14 $std.VIDEO_CMD_VSYNC
+	busout #13 #14 #15
+
+	movi u32 #13 $std.BUS_DEV_VIDEO_TEXT
+	movi u32 #14 $std.VTXT_CMD_CLEAR
+	busout #13 #14 #15
+	jmp loop

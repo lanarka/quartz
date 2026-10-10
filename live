@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+python3 scripts/watchdog.py -w sdk/examples/live.quartz -c ./run live

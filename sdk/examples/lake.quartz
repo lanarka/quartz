@@ -1,0 +1,882 @@
+// =============================================================================
+// LakeBios 0.1 - a minimal text-mode bootloader for Quartz Computer
+// =============================================================================
+//
+// EL-TORITO:
+//   1. Check which of BUS_DEV_DISK0/BUS_DEV_DISK1 are attached (OP_BUS_STATUS).
+//        - neither attached  -> print "Disk not connected", idle forever.
+//        - exactly one       -> boot from that one directly.
+//        - both attached     -> show a Turbo-Vision-style dialog box
+//          ("Disk 0" / "Disk 1", Up/Down to move, Enter to confirm,
+//          white text on a blue box) so the user picks which one to boot.
+//   2. "Booting" a disk means: read LBA 0, check the 2-byte magic
+//      (0xB0, 0x01). If it doesn't match -> print "No bootable media
+//      found" and idle forever (the host window stays open either way,
+//      driven by OP_BUS_VSYNC every idle iteration, until closed).
+//      If it matches, the rest of the boot sector gives the LBA/size/
+//      entrypoint of the kernel image, which gets read into RAM and
+//      launched with OP_VMX ("warm restart").
+//
+// Boot sector layout (LBA 0, first 11 bytes):
+//   offset 0   [2 bytes] magic 0xB0, 0x01
+//   offset 2   [1 byte ] kernel_start_lba     LBA where the kernel begins
+//   offset 3   [4 bytes] kernel_size_bytes    little-endian
+//   offset 7   [4 bytes] kernel_entrypoint    little-endian
+//
+// kernel_entrypoint is an OFFSET into the loaded kernel data (exactly like
+// a .bin file's own entrypoint, or OP_VMX's `entry` operand) - NOT an
+// absolute RAM address. OP_VMX copies the kernel into its own fresh code
+// segment starting at index 0, so entry must be < kernel_size_bytes.
+//
+// Register convention used throughout this file (to avoid the classic
+// "callee clobbers a register the caller still needed" bug):
+//   #0-#4, #10, #11   - pure scratch, NEVER expected to survive a `call`.
+//                       print_char_at/print_string_at only ever touch these.
+//   #5-#9, #12-#15    - a subroutine's OWN local variables, safe to keep
+//                       live across a `call` it makes itself (as long as
+//                       the callee sticks to the rule above).
+//   Anything that must survive a call FROM a routine that also needs
+//   #5-#9/#12-#15 for its own bookkeeping is instead kept in RAM
+//   (ADDR_*/$P0-P9 below) - simple, and impossible to get wrong.
+// =============================================================================
+
+%entrypoint start
+
+%include "std.quartz"
+%include "kb.quartz"
+
+%define TEXT_FG        0xFFFFFFFF   // ABGR: white
+%define TEXT_BG        0xFF000000   // ABGR: black
+%define DIALOG_FG      0xFFFFFFFF   // ABGR: white   (normal item)
+%define DIALOG_BG      0xFFFF0000   // ABGR: blue    (normal item)
+%define DIALOG_FG_SEL  0xFFFF0000   // ABGR: blue    (selected item, inverted)
+%define DIALOG_BG_SEL  0xFFFFFFFF   // ABGR: white   (selected item, inverted)
+%define DIALOG_BOX_W   20
+
+// RAM layout
+%define BOOT_SECTOR_ADDR       0        // 512-byte scratch buffer for LBA 0
+%define KERNEL_LOAD_ADDR       0x1000   // where the kernel gets read/launched
+
+%define STR_TITLE              512
+%define STR_DISK_NOT_CONNECTED 552
+%define STR_NO_BOOTABLE        592
+%define STR_SELECT_BOOT_DISK   632
+%define STR_DISK0_LABEL        672
+%define STR_DISK1_LABEL        688
+
+%define ADDR_DISK0_PRESENT     800
+%define ADDR_DISK1_PRESENT     804
+%define ADDR_CHOSEN_DISK       808
+%define ADDR_BOX_X             812
+%define ADDR_BOX_Y             816
+%define ADDR_SELECTION         820
+%define ADDR_PREV_UP           824
+%define ADDR_PREV_DOWN         828
+%define ADDR_PREV_ENTER        832
+%define ADDR_KEYBUF            836   // 8 bytes (4x u16) for INB KBD_PORT_POLL
+
+%define ADDR_KERNEL_LBA        900
+%define ADDR_KERNEL_SIZE       904
+%define ADDR_KERNEL_ENTRY      908
+%define ADDR_TMP1              912
+
+// generic call-parameter slots (like a tiny calling convention)
+%define P0  1000
+%define P1  1004
+%define P2  1008
+%define P3  1012
+%define P4  1016
+
+
+// =============================================================================
+// start
+// =============================================================================
+start:
+	call write_strings            // must run first - every message below reads these
+
+	movi u32 #0 $std.BUS_DEV_VIDEO_TEXT
+	movi u32 #1 $std.VTXT_CMD_CLEAR
+	busout #0 #1 #1
+
+	movi u32 #1 $std.VTXT_CMD_CURENA
+	movi u32 #2 0
+	busout #0 #1 #2              // hide the text cursor - this is a BIOS screen, not a prompt
+
+	movi u32 #0 $STR_TITLE
+	store u32 $P0 #0
+	movi u32 #0 0
+	store u32 $P1 #0
+	movi u32 #0 0
+	store u32 $P2 #0
+	movi u32 #0 $TEXT_FG
+	store u32 $P3 #0
+	movi u32 #0 $TEXT_BG
+	store u32 $P4 #0
+	call print_string_at          // "LakeBios 0.1" at (0,0)
+
+	// which disks are attached?
+	movi u32 #0 $std.BUS_DEV_DISK0
+	busstat #0 #1
+	store u32 $ADDR_DISK0_PRESENT #1
+
+	movi u32 #0 $std.BUS_DEV_DISK1
+	busstat #0 #1
+	store u32 $ADDR_DISK1_PRESENT #1
+
+	load u32 #2 $ADDR_DISK0_PRESENT
+	load u32 #3 $ADDR_DISK1_PRESENT
+
+	cmpi u32 #2 0
+	jnz start_have_disk0
+	cmpi u32 #3 0
+	jnz start_disk1_only
+
+	// neither disk attached
+	call print_disk_not_connected
+	jmp halt_loop
+
+start_disk1_only:
+	movi u32 #0 $std.BUS_DEV_DISK1
+	store u32 $ADDR_CHOSEN_DISK #0
+	jmp start_do_boot
+
+start_have_disk0:
+	cmpi u32 #3 0
+	jz start_disk0_only
+
+	// both disks attached: ask the user
+	call disk_select_dialog       // stores the chosen device id into $ADDR_CHOSEN_DISK
+	jmp start_do_boot
+
+start_disk0_only:
+	movi u32 #0 $std.BUS_DEV_DISK0
+	store u32 $ADDR_CHOSEN_DISK #0
+
+start_do_boot:
+	call boot_from_disk
+	// only returns here if the chosen disk turned out not to be bootable
+	// (boot_from_disk already printed the message) - fall through to idle.
+
+halt_loop:
+	movi u32 #0 $std.BUS_DEV_VIDEO
+	movi u32 #1 $std.VIDEO_CMD_VSYNC
+	busout #0 #1 #1
+	jmp halt_loop
+
+
+// =============================================================================
+// print_disk_not_connected / print_no_bootable_media
+// =============================================================================
+print_disk_not_connected:
+	movi u32 #0 $STR_DISK_NOT_CONNECTED
+	store u32 $P0 #0
+	movi u32 #0 0
+	store u32 $P1 #0
+	movi u32 #0 1
+	store u32 $P2 #0
+	movi u32 #0 $TEXT_FG
+	store u32 $P3 #0
+	movi u32 #0 $TEXT_BG
+	store u32 $P4 #0
+	call print_string_at
+	ret
+
+print_no_bootable_media:
+	movi u32 #0 $std.BUS_DEV_VIDEO_TEXT
+	movi u32 #1 $std.VTXT_CMD_CLEAR
+	busout #0 #1 #1
+
+	movi u32 #0 $STR_NO_BOOTABLE
+	store u32 $P0 #0
+	movi u32 #0 0
+	store u32 $P1 #0
+	movi u32 #0 0
+	store u32 $P2 #0
+	movi u32 #0 $TEXT_FG
+	store u32 $P3 #0
+	movi u32 #0 $TEXT_BG
+	store u32 $P4 #0
+	call print_string_at
+	ret
+
+
+// =============================================================================
+// boot_from_disk
+//   input:  $ADDR_CHOSEN_DISK (BUS_DEV_DISK0 or BUS_DEV_DISK1)
+//   on failure: prints "No bootable media found" and returns.
+//   on success: never returns (OP_VMX hands control to the kernel).
+// =============================================================================
+boot_from_disk:
+	load u32 #5 $ADDR_CHOSEN_DISK   // #5 = dev id - kept alive for the whole routine
+
+	// read LBA 0 (the boot sector) into RAM
+	movi u32 #10 $std.DISK_PORT_LBA
+	movi u32 #0 0
+	busout #5 #10 #0
+
+	movi u32 #10 $std.DISK_CMD_READ
+	movi u32 #0 $BOOT_SECTOR_ADDR
+	movi u32 #1 512
+	businb #5 #10 #0 #1 #11        // #11 = bytes actually read, or -1
+
+	// check the magic (0xB0, 0x01)
+	load u8 #0 0
+	cmpi u8 #0 0xB0
+	jnz bfd_not_bootable
+	load u8 #0 1
+	cmpi u8 #0 0x01
+	jnz bfd_not_bootable
+
+	// parse the rest of the header
+	load u8  #6 2                  // #6 = kernel_start_lba
+	load u32 #7 3                  // #7 = kernel_size_bytes
+	load u32 #8 7                  // #8 = kernel_entrypoint
+
+	cmpi u32 #7 0
+	jz bfd_not_bootable            // zero-length kernel
+
+	cmp u32 #8 #7
+	jge bfd_not_bootable           // entrypoint outside the kernel data
+
+	store u32 $ADDR_KERNEL_LBA   #6
+	store u32 $ADDR_KERNEL_SIZE  #7
+	store u32 $ADDR_KERNEL_ENTRY #8
+
+	// does the kernel actually fit into RAM at KERNEL_LOAD_ADDR?
+	// (computed as "ram_size - KERNEL_LOAD_ADDR >= kernel_size", never as
+	// "KERNEL_LOAD_ADDR + kernel_size <= ram_size" - the latter can wrap
+	// around for a corrupt/adversarial kernel_size_bytes close to 2^32-1)
+	ramsize #9                     // #9 = ram_size
+	movi u32 #0 $KERNEL_LOAD_ADDR
+	cmp  u32 #9 #0
+	jle bfd_not_bootable           // RAM smaller than the load address itself
+	sub  u32 #9 #0                 // #9 = largest kernel that still fits
+	cmp  u32 #7 #9
+	jg bfd_not_bootable
+
+	// read the kernel data
+	movi u32 #10 $std.DISK_PORT_LBA
+	busout #5 #10 #6
+
+	movi u32 #10 $std.DISK_CMD_READ
+	movi u32 #0 $KERNEL_LOAD_ADDR
+	businb #5 #10 #0 #7 #11        // #11 = bytes actually read, or -1
+
+	// clear the screen, beep, and warm-reset into the kernel
+	movi u32 #0 $std.BUS_DEV_VIDEO_TEXT
+	movi u32 #1 $std.VTXT_CMD_CLEAR
+	busout #0 #1 #1
+	bell
+
+	movi u32 #0 $KERNEL_LOAD_ADDR
+	vmx #0 #7 #8                   // addr, len, entry - control does not return
+	ret                             // unreachable
+
+bfd_not_bootable:
+	call print_no_bootable_media
+	ret
+
+
+// =============================================================================
+// disk_select_dialog
+//   Turbo-Vision-style modal: a bordered box with "Disk 0"/"Disk 1", the
+//   active item drawn with inverted colors, Up/Down to move, Enter to pick.
+//   Result: BUS_DEV_DISK0 or BUS_DEV_DISK1 stored into $ADDR_CHOSEN_DISK.
+// =============================================================================
+disk_select_dialog:
+	movi u32 #0 0
+	store u32 $P0 #0
+	movi u32 #0 0
+	store u32 $P1 #0
+	movi u32 #0 2
+	store u32 $P2 #0
+	movi u32 #0 $TEXT_FG
+	store u32 $P3 #0
+	movi u32 #0 $TEXT_BG
+	store u32 $P4 #0
+	movi u32 #0 $STR_SELECT_BOOT_DISK
+	store u32 $P0 #0
+	call print_string_at          // hint line, once: "Select boot disk:" at (0,2)
+
+	movi u32 #0 $std.BUS_DEV_VIDEO_TEXT
+	movi u32 #1 $std.VTXT_PORT_ROWS
+	busin #0 #1 #2                // #2 = rows
+	movi u32 #1 $std.VTXT_PORT_COLS
+	busin #0 #1 #3                // #3 = cols
+
+	mov  #4 #3
+	subi u32 #4 $DIALOG_BOX_W
+	movi u32 #5 2
+	div  u32 #4 #5
+	store u32 $ADDR_BOX_X #4        // box_x = (cols - DIALOG_BOX_W) / 2
+
+	mov  #4 #2
+	subi u32 #4 4                  // box_h = 4 (top border, item0, item1, bottom border)
+	div  u32 #4 #5
+	store u32 $ADDR_BOX_Y #4        // box_y = (rows - 4) / 2
+
+	movi u32 #0 0
+	store u32 $ADDR_SELECTION #0
+	store u32 $ADDR_PREV_UP #0
+	store u32 $ADDR_PREV_DOWN #0
+	store u32 $ADDR_PREV_ENTER #0
+
+dsd_loop:
+	call dsd_draw
+
+	movi u32 #0 $std.BUS_DEV_VIDEO
+	movi u32 #1 $std.VIDEO_CMD_VSYNC
+	busout #0 #1 #1
+
+	movi u32 #0 $std.BUS_DEV_KEYBOARD
+	movi u32 #1 $std.KBD_PORT_POLL
+	movi u32 #2 $ADDR_KEYBUF
+	movi u32 #3 8
+	businb #0 #1 #2 #3 #4          // fills $ADDR_KEYBUF..+7 (4x u16) with held keys
+
+	// Up arrow: move selection up (edge-triggered - only on press, not while held)
+	movi u32 #5 0
+	load u16 #6 $ADDR_KEYBUF
+	cmpi u16 #6 $kb.KEY_UP
+	jz dsd_up_held
+	load u16 #6 838
+	cmpi u16 #6 $kb.KEY_UP
+	jz dsd_up_held
+	load u16 #6 840
+	cmpi u16 #6 $kb.KEY_UP
+	jz dsd_up_held
+	load u16 #6 842
+	cmpi u16 #6 $kb.KEY_UP
+	jz dsd_up_held
+	jmp dsd_up_checked
+dsd_up_held:
+	movi u32 #5 1
+dsd_up_checked:
+	load u32 #7 $ADDR_PREV_UP
+	store u32 $ADDR_PREV_UP #5
+	cmpi u32 #5 0
+	jz dsd_check_down
+	cmpi u32 #7 0
+	jnz dsd_check_down             // was already held last frame - ignore
+	load u32 #0 $ADDR_SELECTION
+	cmpi u32 #0 0
+	jz dsd_check_down
+	subi u32 #0 1
+	store u32 $ADDR_SELECTION #0
+
+dsd_check_down:
+	movi u32 #5 0
+	load u16 #6 $ADDR_KEYBUF
+	cmpi u16 #6 $kb.KEY_DOWN
+	jz dsd_down_held
+	load u16 #6 838
+	cmpi u16 #6 $kb.KEY_DOWN
+	jz dsd_down_held
+	load u16 #6 840
+	cmpi u16 #6 $kb.KEY_DOWN
+	jz dsd_down_held
+	load u16 #6 842
+	cmpi u16 #6 $kb.KEY_DOWN
+	jz dsd_down_held
+	jmp dsd_down_checked
+dsd_down_held:
+	movi u32 #5 1
+dsd_down_checked:
+	load u32 #7 $ADDR_PREV_DOWN
+	store u32 $ADDR_PREV_DOWN #5
+	cmpi u32 #5 0
+	jz dsd_check_enter
+	cmpi u32 #7 0
+	jnz dsd_check_enter
+	load u32 #0 $ADDR_SELECTION
+	cmpi u32 #0 1
+	jz dsd_check_enter
+	addi u32 #0 1
+	store u32 $ADDR_SELECTION #0
+
+dsd_check_enter:
+	movi u32 #5 0
+	load u16 #6 $ADDR_KEYBUF
+	cmpi u16 #6 $kb.KEY_ENTER
+	jz dsd_enter_held
+	load u16 #6 838
+	cmpi u16 #6 $kb.KEY_ENTER
+	jz dsd_enter_held
+	load u16 #6 840
+	cmpi u16 #6 $kb.KEY_ENTER
+	jz dsd_enter_held
+	load u16 #6 842
+	cmpi u16 #6 $kb.KEY_ENTER
+	jz dsd_enter_held
+	jmp dsd_enter_checked
+dsd_enter_held:
+	movi u32 #5 1
+dsd_enter_checked:
+	load u32 #7 $ADDR_PREV_ENTER
+	store u32 $ADDR_PREV_ENTER #5
+	cmpi u32 #5 0
+	jz dsd_loop
+	cmpi u32 #7 0
+	jnz dsd_loop
+	// Enter, freshly pressed -> confirm the selection
+
+	load u32 #0 $ADDR_SELECTION
+	cmpi u32 #0 0
+	jz dsd_pick0
+	movi u32 #0 $std.BUS_DEV_DISK1
+	store u32 $ADDR_CHOSEN_DISK #0
+	ret
+dsd_pick0:
+	movi u32 #0 $std.BUS_DEV_DISK0
+	store u32 $ADDR_CHOSEN_DISK #0
+	ret
+
+
+// =============================================================================
+// dsd_draw - redraws the whole dialog box from $ADDR_BOX_X/BOX_Y/SELECTION.
+// =============================================================================
+dsd_draw:
+	load u32 #0 $ADDR_BOX_X
+	load u32 #1 $ADDR_BOX_Y
+	store u32 $P0 #0
+	store u32 $P1 #1
+	movi u32 #0 0
+	store u32 $P2 #0
+	call dsd_draw_border_row       // top border  (╔══..══╗)
+
+	load u32 #0 $ADDR_BOX_X
+	load u32 #1 $ADDR_BOX_Y
+	addi u32 #1 1
+	store u32 $P0 #0
+	store u32 $P1 #1
+	load u32 #2 $ADDR_SELECTION
+	cmpi u32 #2 0
+	jnz dd_item0_not_sel
+	movi u32 #2 1
+	jmp dd_item0_store
+dd_item0_not_sel:
+	movi u32 #2 0
+dd_item0_store:
+	store u32 $P2 #2
+	movi u32 #2 $STR_DISK0_LABEL
+	store u32 $P3 #2
+	call dsd_draw_item_row         // "Disk 0" row
+
+	load u32 #0 $ADDR_BOX_X
+	load u32 #1 $ADDR_BOX_Y
+	addi u32 #1 2
+	store u32 $P0 #0
+	store u32 $P1 #1
+	load u32 #2 $ADDR_SELECTION
+	cmpi u32 #2 1
+	jnz dd_item1_not_sel
+	movi u32 #2 1
+	jmp dd_item1_store
+dd_item1_not_sel:
+	movi u32 #2 0
+dd_item1_store:
+	store u32 $P2 #2
+	movi u32 #2 $STR_DISK1_LABEL
+	store u32 $P3 #2
+	call dsd_draw_item_row         // "Disk 1" row
+
+	load u32 #0 $ADDR_BOX_X
+	load u32 #1 $ADDR_BOX_Y
+	addi u32 #1 3
+	store u32 $P0 #0
+	store u32 $P1 #1
+	movi u32 #0 1
+	store u32 $P2 #0
+	call dsd_draw_border_row       // bottom border (╚══..══╝)
+	ret
+
+
+// =============================================================================
+// dsd_draw_border_row - params: $P0=box_x, $P1=row_y, $P2=is_bottom(0/1)
+// =============================================================================
+dsd_draw_border_row:
+	load u32 #6 $P0
+	load u32 #7 $P1
+	load u32 #12 $P2
+
+	cmpi u32 #12 0
+	jz dbr_top
+	movi u32 #14 9562              // ╚
+	movi u32 #15 9565               // ╝
+	jmp dbr_corners_done
+dbr_top:
+	movi u32 #14 9556              // ╔
+	movi u32 #15 9559               // ╗
+dbr_corners_done:
+
+	store u32 $P0 #6
+	store u32 $P1 #7
+	store u32 $P2 #14
+	movi u32 #0 $DIALOG_FG
+	store u32 $P3 #0
+	movi u32 #0 $DIALOG_BG
+	store u32 $P4 #0
+	call print_char_at             // left corner
+
+	mov  #9 #6
+	addi u32 #9 1
+	mov  #8 #6
+	addi u32 #8 $DIALOG_BOX_W
+	subi u32 #8 1                  // #8 = right corner column
+dbr_loop:
+	cmp u32 #9 #8
+	jge dbr_loop_done
+	store u32 $P0 #9
+	store u32 $P1 #7
+	movi u32 #0 9552                // ═
+	store u32 $P2 #0
+	movi u32 #0 $DIALOG_FG
+	store u32 $P3 #0
+	movi u32 #0 $DIALOG_BG
+	store u32 $P4 #0
+	call print_char_at
+	inc u32 #9
+	jmp dbr_loop
+dbr_loop_done:
+
+	store u32 $P0 #8
+	store u32 $P1 #7
+	store u32 $P2 #15
+	movi u32 #0 $DIALOG_FG
+	store u32 $P3 #0
+	movi u32 #0 $DIALOG_BG
+	store u32 $P4 #0
+	call print_char_at             // right corner
+	ret
+
+
+// =============================================================================
+// dsd_draw_item_row - params: $P0=box_x, $P1=row_y, $P2=is_selected(0/1),
+//                             $P3=label_addr (NUL-terminated)
+// =============================================================================
+dsd_draw_item_row:
+	load u32 #6 $P0
+	load u32 #7 $P1
+	load u32 #12 $P2
+	load u32 #13 $P3
+
+	cmpi u32 #12 0
+	jz dsdr_normal
+	movi u32 #14 $DIALOG_FG_SEL
+	movi u32 #15 $DIALOG_BG_SEL
+	jmp dsdr_colors_done
+dsdr_normal:
+	movi u32 #14 $DIALOG_FG
+	movi u32 #15 $DIALOG_BG
+dsdr_colors_done:
+
+	// left border │ (always plain dialog colors, never highlighted)
+	store u32 $P0 #6
+	store u32 $P1 #7
+	movi u32 #0 9553
+	store u32 $P2 #0
+	movi u32 #0 $DIALOG_FG
+	store u32 $P3 #0
+	movi u32 #0 $DIALOG_BG
+	store u32 $P4 #0
+	call print_char_at
+
+	// interior: box_x+1 .. box_x+(DIALOG_BOX_W-2), filled with spaces in the
+	// item's colors so the whole row highlights, not just the label text.
+	mov  #9 #6
+	addi u32 #9 1
+	mov  #8 #6
+	addi u32 #8 $DIALOG_BOX_W
+	subi u32 #8 1                  // #8 = right border column (also the fill loop's bound)
+dsdr_fill_loop:
+	cmp u32 #9 #8
+	jge dsdr_fill_done
+	store u32 $P0 #9
+	store u32 $P1 #7
+	movi u32 #0 32
+	store u32 $P2 #0
+	store u32 $P3 #14
+	store u32 $P4 #15
+	call print_char_at
+	inc u32 #9
+	jmp dsdr_fill_loop
+dsdr_fill_done:
+
+	// overlay the label, 2 columns in from the left border
+	// NOTE: print_string_at is NOT a leaf like print_char_at - it uses
+	// #5-#9 as its OWN locals, so #8 (our right-border column) would not
+	// survive the call. Spill it to RAM and reload it afterwards.
+	store u32 $ADDR_TMP1 #8
+	store u32 $P0 #13
+	mov  #0 #6
+	addi u32 #0 3
+	store u32 $P1 #0
+	store u32 $P2 #7
+	store u32 $P3 #14
+	store u32 $P4 #15
+	call print_string_at
+	load u32 #8 $ADDR_TMP1
+
+	// right border │ (column restored into #8)
+	store u32 $P0 #8
+	store u32 $P1 #7
+	movi u32 #0 9553
+	store u32 $P2 #0
+	movi u32 #0 $DIALOG_FG
+	store u32 $P3 #0
+	movi u32 #0 $DIALOG_BG
+	store u32 $P4 #0
+	call print_char_at
+	ret
+
+
+// =============================================================================
+// print_char_at - params: $P0=x, $P1=y, $P2=codepoint, $P3=fg, $P4=bg
+// Leaf helper - the only registers ANY caller may assume this clobbers.
+// =============================================================================
+print_char_at:
+	load u32 #0 $P0
+	load u32 #1 $P1
+	load u32 #2 $P2
+	load u32 #3 $P3
+	load u32 #4 $P4
+
+	movi u32 #10 $std.BUS_DEV_VIDEO_TEXT
+	movi u32 #11 $std.VTXT_PORT_X
+	busout #10 #11 #0
+	movi u32 #11 $std.VTXT_PORT_Y
+	busout #10 #11 #1
+	movi u32 #11 $std.VTXT_PORT_CODEPOINT
+	busout #10 #11 #2
+	movi u32 #11 $std.VTXT_PORT_FG
+	busout #10 #11 #3
+	movi u32 #11 $std.VTXT_PORT_BG
+	busout #10 #11 #4
+	movi u32 #11 $std.VTXT_CMD_CHAR
+	busout #10 #11 #11
+	ret
+
+
+// =============================================================================
+// print_string_at - params: $P0=addr (NUL-terminated), $P1=x, $P2=y, $P3=fg, $P4=bg
+// Draws left-to-right starting at (x,y). Only calls print_char_at, so only
+// #0-#4/#10/#11 are ever at risk - our own #5-#9 survive the whole loop.
+// =============================================================================
+print_string_at:
+	load u32 #5 $P0                 // #5 = string address (advances)
+	load u32 #6 $P1                 // #6 = x (advances)
+	load u32 #7 $P2                 // #7 = y
+	load u32 #8 $P3                 // #8 = fg
+	load u32 #9 $P4                 // #9 = bg
+psa_loop:
+	loadr u8 #0 #5
+	cmpi u8 #0 0
+	jz psa_done
+
+	store u32 $P0 #6
+	store u32 $P1 #7
+	store u32 $P2 #0
+	store u32 $P3 #8
+	store u32 $P4 #9
+	call print_char_at
+
+	inc u32 #5
+	inc u32 #6
+	jmp psa_loop
+psa_done:
+	ret
+
+
+// =============================================================================
+// String literals (NUL-terminated)
+// =============================================================================
+write_strings:
+	// "LakeBios 0.1" @ STR_TITLE
+	movi u8 #0 'L'
+	store u8 512 #0
+	movi u8 #0 'a'
+	store u8 513 #0
+	movi u8 #0 'k'
+	store u8 514 #0
+	movi u8 #0 'e'
+	store u8 515 #0
+	movi u8 #0 'B'
+	store u8 516 #0
+	movi u8 #0 'i'
+	store u8 517 #0
+	movi u8 #0 'o'
+	store u8 518 #0
+	movi u8 #0 's'
+	store u8 519 #0
+	movi u8 #0 ' '
+	store u8 520 #0
+	movi u8 #0 '0'
+	store u8 521 #0
+	movi u8 #0 '.'
+	store u8 522 #0
+	movi u8 #0 '1'
+	store u8 523 #0
+	movi u8 #0 0
+	store u8 524 #0
+
+	// "Disk not connected" @ STR_DISK_NOT_CONNECTED
+	movi u8 #0 'D'
+	store u8 552 #0
+	movi u8 #0 'i'
+	store u8 553 #0
+	movi u8 #0 's'
+	store u8 554 #0
+	movi u8 #0 'k'
+	store u8 555 #0
+	movi u8 #0 ' '
+	store u8 556 #0
+	movi u8 #0 'n'
+	store u8 557 #0
+	movi u8 #0 'o'
+	store u8 558 #0
+	movi u8 #0 't'
+	store u8 559 #0
+	movi u8 #0 ' '
+	store u8 560 #0
+	movi u8 #0 'c'
+	store u8 561 #0
+	movi u8 #0 'o'
+	store u8 562 #0
+	movi u8 #0 'n'
+	store u8 563 #0
+	movi u8 #0 'n'
+	store u8 564 #0
+	movi u8 #0 'e'
+	store u8 565 #0
+	movi u8 #0 'c'
+	store u8 566 #0
+	movi u8 #0 't'
+	store u8 567 #0
+	movi u8 #0 'e'
+	store u8 568 #0
+	movi u8 #0 'd'
+	store u8 569 #0
+	movi u8 #0 0
+	store u8 570 #0
+
+	// "No bootable media found" @ STR_NO_BOOTABLE
+	movi u8 #0 'N'
+	store u8 592 #0
+	movi u8 #0 'o'
+	store u8 593 #0
+	movi u8 #0 ' '
+	store u8 594 #0
+	movi u8 #0 'b'
+	store u8 595 #0
+	movi u8 #0 'o'
+	store u8 596 #0
+	movi u8 #0 'o'
+	store u8 597 #0
+	movi u8 #0 't'
+	store u8 598 #0
+	movi u8 #0 'a'
+	store u8 599 #0
+	movi u8 #0 'b'
+	store u8 600 #0
+	movi u8 #0 'l'
+	store u8 601 #0
+	movi u8 #0 'e'
+	store u8 602 #0
+	movi u8 #0 ' '
+	store u8 603 #0
+	movi u8 #0 'm'
+	store u8 604 #0
+	movi u8 #0 'e'
+	store u8 605 #0
+	movi u8 #0 'd'
+	store u8 606 #0
+	movi u8 #0 'i'
+	store u8 607 #0
+	movi u8 #0 'a'
+	store u8 608 #0
+	movi u8 #0 ' '
+	store u8 609 #0
+	movi u8 #0 'f'
+	store u8 610 #0
+	movi u8 #0 'o'
+	store u8 611 #0
+	movi u8 #0 'u'
+	store u8 612 #0
+	movi u8 #0 'n'
+	store u8 613 #0
+	movi u8 #0 'd'
+	store u8 614 #0
+	movi u8 #0 0
+	store u8 615 #0
+
+	// "Select boot disk:" @ STR_SELECT_BOOT_DISK
+	movi u8 #0 'S'
+	store u8 632 #0
+	movi u8 #0 'e'
+	store u8 633 #0
+	movi u8 #0 'l'
+	store u8 634 #0
+	movi u8 #0 'e'
+	store u8 635 #0
+	movi u8 #0 'c'
+	store u8 636 #0
+	movi u8 #0 't'
+	store u8 637 #0
+	movi u8 #0 ' '
+	store u8 638 #0
+	movi u8 #0 'b'
+	store u8 639 #0
+	movi u8 #0 'o'
+	store u8 640 #0
+	movi u8 #0 'o'
+	store u8 641 #0
+	movi u8 #0 't'
+	store u8 642 #0
+	movi u8 #0 ' '
+	store u8 643 #0
+	movi u8 #0 'd'
+	store u8 644 #0
+	movi u8 #0 'i'
+	store u8 645 #0
+	movi u8 #0 's'
+	store u8 646 #0
+	movi u8 #0 'k'
+	store u8 647 #0
+	movi u8 #0 ':'
+	store u8 648 #0
+	movi u8 #0 0
+	store u8 649 #0
+
+	// "Disk 0" @ STR_DISK0_LABEL
+	movi u8 #0 'D'
+	store u8 672 #0
+	movi u8 #0 'i'
+	store u8 673 #0
+	movi u8 #0 's'
+	store u8 674 #0
+	movi u8 #0 'k'
+	store u8 675 #0
+	movi u8 #0 ' '
+	store u8 676 #0
+	movi u8 #0 '0'
+	store u8 677 #0
+	movi u8 #0 0
+	store u8 678 #0
+
+	// "Disk 1" @ STR_DISK1_LABEL
+	movi u8 #0 'D'
+	store u8 688 #0
+	movi u8 #0 'i'
+	store u8 689 #0
+	movi u8 #0 's'
+	store u8 690 #0
+	movi u8 #0 'k'
+	store u8 691 #0
+	movi u8 #0 ' '
+	store u8 692 #0
+	movi u8 #0 '1'
+	store u8 693 #0
+	movi u8 #0 0
+	store u8 694 #0
+
+	ret

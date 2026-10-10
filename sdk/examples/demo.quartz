@@ -1,0 +1,23 @@
+
+//	DEMO
+
+%entrypoint start
+%include "inc.quartz"
+
+start:
+	bell
+	movi u32 #9 1000000
+	call inc.prog
+	movi i32 #0 0
+	debug i32 #0
+	jmp label1
+
+label2:
+	movi i32 #0 2
+	debug i32 #0
+	jmp inc.label1
+
+label1:
+	movi i32 #0 1
+	debug i32 #0
+	jmp label2

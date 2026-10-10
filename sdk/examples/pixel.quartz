@@ -1,0 +1,20 @@
+%define RED 0xFF0000FF
+
+movi u32  #1 0  // r1 = BUS_DEV_VIDEO
+movi u32  #2 2  // r2 = VIDEO_PORT_X
+movi u32  #3 10
+busout    #1 #2 #3 // stage X = 10
+
+movi u32  #2 3 // r2 = VIDEO_PORT_Y
+movi u32  #3 20
+busout    #1 #2 #3 // stage Y = 20
+
+movi u32  #2 7 // r2 = VIDEO_CMD_PIX
+movi u32  #3 $RED // 0xAABBGGRR = opaque red
+busout    #1 #2 #3 // plot the pixel
+
+loop:
+	movi u32  #2 10 // r2 = VIDEO_CMD_VSYNC
+	movi u32  #3 0  // ignored
+	busout #1 #2 #3
+	jmp loop

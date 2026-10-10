@@ -1,0 +1,25 @@
+// ============================================================================
+// clear.quartz - ported to QuartzVM's BUS instruction set.
+// ============================================================================
+%include "std.quartz"
+
+// register map:
+// #0  scratch    (clear color)
+// #13 bus_dev    (always BUS_DEV_VIDEO here)
+// #14 bus_port   (reloaded before each bus call)
+// #15 bus_val    (OUT payload / ignored placeholder)
+
+	movi u32 #13 $std.BUS_DEV_VIDEO
+	movi u32 #15 0
+
+loop:
+	movi u32 #14 $std.VIDEO_CMD_CLEAR
+	busout #13 #14 #15
+
+	movi u32 #0 0x330000ff
+	movi u32 #14 $std.VIDEO_CMD_CLEARC
+	busout #13 #14 #0
+
+	movi u32 #14 $std.VIDEO_CMD_VSYNC
+	busout #13 #14 #15
+	jmp loop

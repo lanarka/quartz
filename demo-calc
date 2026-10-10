@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+
+# Create assets
+python3 scripts/helpers/images/png2bin_fontsheet.py sdk/examples/calc/assets/src/font_black_sheet.png sdk/examples/calc/assets/font_black_sheet.raw &&
+python3 scripts/helpers/images/png2bin_fontsheet.py sdk/examples/calc/assets/src/font_white_sheet.png sdk/examples/calc/assets/font_white_sheet.raw &&
+python3 scripts/helpers/images/png2bin.py sdk/examples/calc/assets/src/wallpaper.png sdk/examples/calc/assets/wallpaper.raw &&
+
+# Compile
+python3 sdk/qasm/qasm.py sdk/examples/calc/calc.quartz dist/calc.bin &&
+
+# Run
+./build/quartz dist/calc.bin --ram 8388608 --cursor 0

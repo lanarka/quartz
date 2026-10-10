@@ -1,0 +1,47 @@
+// NET TEST
+%include "std.quartz"
+
+// #13 bus_dev, #14 bus_port
+
+	// send packet
+
+	movi u8 #0 1       // packet version
+	store u8 100 #0
+
+	movi u8 #0 'h'
+	store u8 101 #0
+	movi u8 #0 'e'
+	store u8 102 #0
+	movi u8 #0 'l'
+	store u8 103 #0
+	store u8 104 #0
+	movi u8 #0 'o'
+	store u8 105 #0
+
+	movi u32 #1 100
+	movi u32 #2 6      // packet length
+
+	movi u32 #13 $std.BUS_DEV_NETWORK
+	movi u32 #14 $std.NET_CMD_SEND
+	busoutb #13 #14 #1 #2 #3   // #3 = bytes sent, or -1 on failure
+	debug u8 #3
+
+
+loop:
+
+	movi u32 #0 200
+	movi u32 #1 6
+
+	movi u32 #13 $std.BUS_DEV_NETWORK
+	movi u32 #14 $std.NET_CMD_RECV
+	businb #13 #14 #0 #1 #2   // #2 = bytes received (0 = none waiting), or -1 on failure
+	debug u8 #2               // Dst.Len.
+
+	movi u32 #14 $std.NET_PORT_STATUS
+	busin  #13 #14 #3          // #3 = last send/recv status
+	debug u8 #3                // Status
+
+	movi u32 #13 $std.BUS_DEV_VIDEO
+	movi u32 #14 $std.VIDEO_CMD_VSYNC
+	busout #13 #14 #3
+	jmp loop

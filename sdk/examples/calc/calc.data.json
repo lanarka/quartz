@@ -1,0 +1,40 @@
+{
+  "start": "0x2000",
+  "blobs": [
+    {
+      "font_white": {
+        "from_file": "sdk/examples/calc/assets/font_white_sheet.raw"
+      }
+    },
+    {
+      "font_black": {
+        "from_file": "sdk/examples/calc/assets/font_black_sheet.raw"
+      }
+    },
+    {
+      "wallpaper": {
+        "from_file": "sdk/examples/calc/assets/wallpaper.raw"
+      }
+    },
+    {
+      "str_title": {
+        "from_string": "Quartz - The Computer"
+      }
+    },
+    {
+      "str_about": {
+        "from_string": "Quartz OS 1.0"
+      }
+    },
+    {
+      "str_ok": {
+        "from_string": "OK"
+      }
+    },
+    {
+      "str_calctitle": {
+        "from_string": "Calculator"
+      }
+    }
+  ]
+}

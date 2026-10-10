@@ -1,0 +1,1527 @@
+/*
+ * ============================================================================
+ *  "Quartz - The Computer"  --  desktop shell + a simple calculator window
+ * ============================================================================
+ *
+ *  - Wallpaper background (blitted with `xframe` every frame)
+ *  - Top bar "Quartz - The Computer" with a "?" (About) box and a close
+ *    ("X") box -> halts the VM
+ *  - A calculator window, slightly transparent, draggable by its title bar,
+ *    with its own close ("X") box (also halts the VM, since it's the only
+ *    window there is)
+ *  - The calculator supports + - * / on integers, with a running
+ *    accumulator (press an operator to chain, "=" to finish, "C" to clear)
+ *
+ *  Build:
+ *      python3 qasm/qasm.py calc.quartz calc.bin
+ *
+ *  Run:
+ *      ./quartz calc.bin --ram 4194304
+ *
+ * ============================================================================
+ */
+
+%runtime 255
+%entrypoint start
+%data "sdk/examples/calc/calc.data.json"
+%include "../std.quartz"
+// ----------------------------------------------------------------------
+// Data segment layout (see calc.data.json) - base 0x2000
+// ----------------------------------------------------------------------
+//  font_white    @ 0x002000   95 glyphs (ASCII 32..126), 8x14 RGBA, white ink
+//  font_black    @ 0x00C640   same, black ink
+//  wallpaper     @ 0x016C80   640x480 RGBA (desktop background)
+//  str_title     @ 0x142C80   "Quartz - The Computer" (21 bytes)
+//  str_about     @ 0x142C95   "Quartz OS 1.0"         (13 bytes)
+//  str_ok        @ 0x142CA2   "OK"                    (2 bytes)
+//  str_calctitle @ 0x142CA4   "Calculator"            (10 bytes)
+//
+// Font glyph size: 8x14 px = 448 bytes/glyph. glyph(code) =
+//   atlas_base + (code-32)*448   for 32 <= code <= 126
+//
+// ----------------------------------------------------------------------
+// Runtime (non data-segment) RAM layout - base 0x150000
+// ----------------------------------------------------------------------
+//  CURSOR_BUF          640     (10x16 RGBA mouse arrow)
+//  TOPBAR_FILL         61440   (640x24 navy)
+//  WIN_TITLEBAR_FILL   31200   (300x26 navy, alpha 0xE0 - slightly see-thru)
+//  WIN_BODY_FILL       232800  (300x194 white, alpha 0xE0)
+//  CLOSEBOX_FILL       1296    (18x18 light gray, opaque)
+//  MSGBOX_FILL         114400  (260x110 light gray, opaque - About box)
+//  BUTTON_FILL         7680    (80x24 light gray, opaque - About's OK button)
+//  CALCBTN_FILL        8320    (65x32 light gray, opaque - calculator keys)
+//  DISPLAY_FILL        31808   (284x28 white, opaque - calculator display)
+//  G_*/CALC_* globals  ..      (4 bytes each)
+//  P0..P9,R0,R1        ..      (4 bytes each, "call" args/returns)
+//  BTN_CHARS           16      (ASCII code of each of the 16 calc keys)
+//  IT_TEMP             16      (itoa scratch)
+//  DISPLAY_BUF         16      (decimal text of the current display value)
+//
+// Calculator window: fixed size 300x220, position kept in CALC_WIN_X/Y
+// (draggable). Layout inside the window (relative to its own x,y):
+//   title bar   : 0..26          (name "Calculator" + close box)
+//   display     : x 8..292, y 30..58   (DISPLAY_FILL, shows CALC_CUR)
+//   button grid : 4 cols x 4 rows, each key 65x32 with a 6px gap, starting
+//                 at relative (8,64):
+//                     7  8  9  /
+//                     4  5  6  *
+//                     1  2  3  -
+//                     0  C  =  +
+// ----------------------------------------------------------------------
+// ============================================================================
+// ENTRY POINT
+// ============================================================================
+start:
+	call init_buffers
+
+	// mouse reads pixel coordinates for the whole run - stage that once
+	movi u32 #0 $std.BUS_DEV_MOUSE
+	movi u32 #1 $std.MOUSE_PORT_MODE
+	movi u32 #2 0
+	busout #0 #1 #2
+
+	movi u32 #0 0
+	store u32 1865860 #0
+	movi u32 #0 0
+	store u32 1865864 #0
+
+	// center the calculator window on the 640x480 screen
+	movi u32 #0 170
+	store u32 1865876 #0
+	movi u32 #0 130
+	store u32 1865880 #0
+
+	// calculator state
+	movi i32 #0 0
+	store u32 1865884 #0
+	store u32 1865888 #0
+	store u32 1865892 #0
+	store u32 1865896 #0
+	store u32 1865900 #0
+
+	jmp main_loop
+
+// ============================================================================
+// MAIN LOOP
+// ============================================================================
+main_loop:
+	movi u16 #0 0
+	movi u16 #1 0
+	movi u16 #2 640
+	movi u16 #3 480
+	movi u32 #4 93312
+	movi u32 #5 $std.BUS_DEV_VIDEO
+	movi u32 #6 $std.VIDEO_PORT_X
+	busout #5 #6 #0
+	movi u32 #6 $std.VIDEO_PORT_Y
+	busout #5 #6 #1
+	movi u32 #6 $std.VIDEO_PORT_W
+	busout #5 #6 #2
+	movi u32 #6 $std.VIDEO_PORT_H
+	busout #5 #6 #3
+	movi u32 #6 $std.VIDEO_CMD_FRAME
+	movi u32 #7 1228800
+	busoutb #5 #6 #4 #7 #8
+
+	call draw_topbar
+	call draw_calc_window
+
+	load u32 #0 1865860
+	cmpi u32 #0 1
+	jnz main_skip_about
+	call draw_about
+main_skip_about:
+
+	call poll_input
+	call draw_cursor
+	movi u32 #5 $std.BUS_DEV_VIDEO
+	movi u32 #6 $std.VIDEO_CMD_VSYNC
+	busout #5 #6 #6
+
+	load u32 #0 1865860
+	cmpi u32 #0 1
+	jz main_input_about
+	call handle_click_calc_window
+	call update_drag
+	jmp main_loop
+main_input_about:
+	call handle_click_about
+	jmp main_loop
+
+// ============================================================================
+// poll_input: reads mouse, computes click-edge (new left-click this frame)
+// ============================================================================
+poll_input:
+	movi u32 #3 $std.BUS_DEV_MOUSE
+	movi u32 #4 $std.MOUSE_PORT_X
+	busin #3 #4 #0
+	movi u32 #4 $std.MOUSE_PORT_Y
+	busin #3 #4 #1
+	movi u32 #4 $std.MOUSE_PORT_BUTTONS
+	busin #3 #4 #2
+	store u32 1865840 #0
+	store u32 1865844 #1
+	load u32 #3 1865848
+	store u32 1865852 #3
+	store u32 1865848 #2
+	movi u32 #4 1
+	and u32 #2 #4
+	and u32 #3 #4
+	movi u32 #6 0
+	cmp u32 #2 #6
+	jz pi_not_clicked
+	cmp u32 #3 #6
+	jnz pi_not_clicked
+	movi u32 #6 1
+	store u32 1865856 #6
+	ret
+pi_not_clicked:
+	movi u32 #6 0
+	store u32 1865856 #6
+	ret
+
+// ============================================================================
+// draw_cursor
+// ============================================================================
+draw_cursor:
+	load u32 #0 1865840
+	load u32 #1 1865844
+	movi u16 #2 10
+	movi u16 #3 16
+	movi u32 #4 1376256
+	movi u32 #5 $std.BUS_DEV_VIDEO
+	movi u32 #6 $std.VIDEO_PORT_X
+	busout #5 #6 #0
+	movi u32 #6 $std.VIDEO_PORT_Y
+	busout #5 #6 #1
+	movi u32 #6 $std.VIDEO_PORT_W
+	busout #5 #6 #2
+	movi u32 #6 $std.VIDEO_PORT_H
+	busout #5 #6 #3
+	movi u32 #6 $std.VIDEO_CMD_FRAME
+	movi u32 #7 640
+	busoutb #5 #6 #4 #7 #8
+	ret
+
+// ============================================================================
+// handle_click_about: only the OK button reacts, closing the About box
+// ============================================================================
+handle_click_about:
+	load u32 #0 1865856
+	cmpi u32 #0 0
+	jz hca_ret
+
+	load u32 #0 1865840
+	load u32 #1 1865844
+
+	cmpi u32 #0 280
+	jl hca_ret
+	cmpi u32 #0 360
+	jg hca_ret
+	cmpi u32 #1 256
+	jl hca_ret
+	cmpi u32 #1 280
+	jg hca_ret
+
+	movi u32 #2 0
+	store u32 1865860 #2
+hca_ret:
+	ret
+
+// ============================================================================
+// update_drag: single-window drag follow, called every frame
+// ============================================================================
+update_drag:
+	load u32 #0 1865864
+	cmpi u32 #0 1
+	jnz upd_ret
+
+	load u32 #1 1865848
+	movi u32 #2 1
+	and u32 #1 #2
+	cmpi u32 #1 0
+	jz upd_stop
+
+	// new_x = max(0, mouseX - offX)
+	load u32 #4 1865840
+	load u32 #5 1865868
+	cmp u32 #4 #5
+	jl upd_x_zero
+	sub u32 #4 #5
+	jmp upd_x_store
+upd_x_zero:
+	movi u32 #4 0
+upd_x_store:
+	store u32 1865876 #4
+
+	// new_y = max(0, mouseY - offY)
+	load u32 #4 1865844
+	load u32 #5 1865872
+	cmp u32 #4 #5
+	jl upd_y_zero
+	sub u32 #4 #5
+	jmp upd_y_store
+upd_y_zero:
+	movi u32 #4 0
+upd_y_store:
+	store u32 1865880 #4
+	ret
+
+upd_stop:
+	movi u32 #2 0
+	store u32 1865864 #2
+	ret
+
+upd_ret:
+	ret
+
+// ============================================================================
+// handle_click_calc_window: topbar (?, X), the calculator's own title bar
+// (drag/close), and its 16 keys.
+// ============================================================================
+handle_click_calc_window:
+	load u32 #0 1865856
+	cmpi u32 #0 0
+	jz hcw_ret2
+
+	load u32 #0 1865840
+	load u32 #1 1865844
+
+	// main topbar close box: x in [618,636] y in [3,21] -> halt
+	cmpi u32 #0 618
+	jl hcw_about_check
+	cmpi u32 #0 636
+	jg hcw_about_check
+	cmpi u32 #1 3
+	jl hcw_about_check
+	cmpi u32 #1 21
+	jg hcw_about_check
+	halt
+
+hcw_about_check:
+	// main topbar "?" box: x in [596,614] y in [3,21] -> show About box
+	cmpi u32 #0 596
+	jl hcw_win_check
+	cmpi u32 #0 614
+	jg hcw_win_check
+	cmpi u32 #1 3
+	jl hcw_win_check
+	cmpi u32 #1 21
+	jg hcw_win_check
+	movi u32 #2 1
+	store u32 1865860 #2
+	ret
+
+hcw_win_check:
+	load u32 #2 1865876
+	load u32 #3 1865880
+
+	// outside the whole window (300x220)?
+	cmp u32 #0 #2
+	jl hcw_ret2
+	mov #4 #2
+	addi u32 #4 300
+	cmp u32 #0 #4
+	jg hcw_ret2
+	cmp u32 #1 #3
+	jl hcw_ret2
+	mov #4 #3
+	addi u32 #4 220
+	cmp u32 #1 #4
+	jg hcw_ret2
+
+	// close box: relative (278..296, 4..22) -> halt (the only window there is)
+	mov #4 #2
+	addi u32 #4 278
+	cmp u32 #0 #4
+	jl hcw_titlebar_check
+	mov #4 #2
+	addi u32 #4 296
+	cmp u32 #0 #4
+	jg hcw_titlebar_check
+	mov #4 #3
+	addi u32 #4 4
+	cmp u32 #1 #4
+	jl hcw_titlebar_check
+	mov #4 #3
+	addi u32 #4 22
+	cmp u32 #1 #4
+	jg hcw_titlebar_check
+	halt
+
+hcw_titlebar_check:
+	// title bar strip: relative y in [0,26) -> start dragging
+	mov #4 #3
+	addi u32 #4 26
+	cmp u32 #1 #4
+	jge hcw_buttons_check
+
+	load u32 #4 1865840
+	sub u32 #4 #2
+	store u32 1865868 #4
+	load u32 #4 1865844
+	sub u32 #4 #3
+	store u32 1865872 #4
+	movi u32 #4 1
+	store u32 1865864 #4
+	ret
+
+hcw_buttons_check:
+	// relative coords within the window
+	mov #4 #0
+	sub u32 #4 #2
+	store u32 1866052 #4
+	mov #5 #1
+	sub u32 #5 #3
+	store u32 1866056 #5
+
+	// grid starts at rel (8,64); each cell 65 wide/32 tall with a 6px gap
+	cmpi u32 #4 8
+	jl hcw_ret2
+	cmpi u32 #5 64
+	jl hcw_ret2
+
+	load u32 #4 1866052
+	subi u32 #4 8
+	movi u32 #6 71
+	mov #7 #4
+	div u32 #4 #6          // col
+	mod u32 #7 #6          // x mod 71
+	cmpi u32 #7 65
+	jge hcw_ret2
+	cmpi u32 #4 3
+	jg hcw_ret2
+
+	load u32 #5 1866056
+	subi u32 #5 64
+	movi u32 #6 38
+	mov #8 #5
+	div u32 #5 #6          // row
+	mod u32 #8 #6          // y mod 38
+	cmpi u32 #8 32
+	jge hcw_ret2
+	cmpi u32 #5 3
+	jg hcw_ret2
+
+	// index = row*4 + col
+	mov #9 #5
+	movi u32 #10 4
+	mul u32 #9 #10
+	add u32 #9 #4
+	store u32 1866044 #9
+
+	movi u32 #11 1866104
+	add u32 #11 #9
+	loadr u8 #12 #11
+	store u32 1866048 #12
+
+	call calc_press
+	ret
+
+hcw_ret2:
+	ret
+
+// ============================================================================
+// fill_rect (P0=addr, P1=w, P2=h, P3=color[u32])
+// ============================================================================
+fill_rect:
+	load u32 #0 1865904
+	load u32 #1 1865908
+	load u32 #2 1865912
+	load u32 #3 1865916
+	mul u32 #1 #2
+	store u32 1865992 #1
+	mov #4 #0
+	movi u32 #5 0
+fr_loop:
+	load u32 #6 1865992
+	cmp u32 #5 #6
+	jge fr_done
+	storer u32 #4 #3
+	addi u32 #4 4
+	inc u32 #5
+	jmp fr_loop
+fr_done:
+	ret
+
+// ============================================================================
+// draw_border (P0=x, P1=y, P2=w, P3=h, P4=color)
+// ============================================================================
+draw_border:
+	load u32 #0 1865904
+	load u32 #1 1865908
+	load u32 #2 1865912
+	load u32 #3 1865916
+	load u32 #4 1865920
+	store u32 1866004 #0
+	store u32 1866008 #1
+	store u32 1866012 #2
+	store u32 1866016 #3
+	store u32 1866020 #4
+
+	movi u32 #5 0
+db_top_loop:
+	load u32 #2 1866012
+	cmp u32 #5 #2
+	jge db_top_done
+	load u32 #0 1866004
+	add u32 #0 #5
+	load u32 #1 1866008
+	load u32 #4 1866020
+	movi u32 #6 $std.BUS_DEV_VIDEO
+	movi u32 #7 $std.VIDEO_PORT_X
+	busout #6 #7 #0
+	movi u32 #7 $std.VIDEO_PORT_Y
+	busout #6 #7 #1
+	movi u32 #7 $std.VIDEO_CMD_PIX
+	busout #6 #7 #4
+	load u32 #1 1866008
+	load u32 #3 1866016
+	subi u32 #3 1
+	add u32 #1 #3
+	movi u32 #6 $std.BUS_DEV_VIDEO
+	movi u32 #7 $std.VIDEO_PORT_X
+	busout #6 #7 #0
+	movi u32 #7 $std.VIDEO_PORT_Y
+	busout #6 #7 #1
+	movi u32 #7 $std.VIDEO_CMD_PIX
+	busout #6 #7 #4
+	inc u32 #5
+	jmp db_top_loop
+db_top_done:
+
+	movi u32 #5 0
+db_side_loop:
+	load u32 #3 1866016
+	cmp u32 #5 #3
+	jge db_side_done
+	load u32 #0 1866004
+	load u32 #1 1866008
+	add u32 #1 #5
+	load u32 #4 1866020
+	movi u32 #6 $std.BUS_DEV_VIDEO
+	movi u32 #7 $std.VIDEO_PORT_X
+	busout #6 #7 #0
+	movi u32 #7 $std.VIDEO_PORT_Y
+	busout #6 #7 #1
+	movi u32 #7 $std.VIDEO_CMD_PIX
+	busout #6 #7 #4
+	load u32 #0 1866004
+	load u32 #2 1866012
+	subi u32 #2 1
+	add u32 #0 #2
+	movi u32 #6 $std.BUS_DEV_VIDEO
+	movi u32 #7 $std.VIDEO_PORT_X
+	busout #6 #7 #0
+	movi u32 #7 $std.VIDEO_PORT_Y
+	busout #6 #7 #1
+	movi u32 #7 $std.VIDEO_CMD_PIX
+	busout #6 #7 #4
+	inc u32 #5
+	jmp db_side_loop
+db_side_done:
+	ret
+
+// ============================================================================
+// draw_char (P0=x, P1=y, P2=code, P3=atlas_base)
+// ============================================================================
+draw_char:
+	load u32 #0 1865912
+	cmpi u32 #0 32
+	jl dc_ret
+	cmpi u32 #0 126
+	jg dc_ret
+	subi u32 #0 32
+	movi u32 #1 448
+	mul u32 #0 #1
+	load u32 #2 1865916
+	add u32 #2 #0
+	load u32 #3 1865904
+	load u32 #4 1865908
+	movi u16 #5 8
+	movi u16 #6 14
+	movi u32 #7 $std.BUS_DEV_VIDEO
+	movi u32 #8 $std.VIDEO_PORT_X
+	busout #7 #8 #3
+	movi u32 #8 $std.VIDEO_PORT_Y
+	busout #7 #8 #4
+	movi u32 #8 $std.VIDEO_PORT_W
+	busout #7 #8 #5
+	movi u32 #8 $std.VIDEO_PORT_H
+	busout #7 #8 #6
+	movi u32 #8 $std.VIDEO_CMD_FRAME
+	movi u32 #9 448
+	busoutb #7 #8 #2 #9 #10
+dc_ret:
+	ret
+
+// ============================================================================
+// draw_text (P0=x, P1=y, P2=str_addr, P3=len, P4=atlas_base)
+// ============================================================================
+draw_text:
+	load u32 #0 1865904
+	store u32 1865952 #0
+	load u32 #0 1865908
+	store u32 1865956 #0
+	load u32 #0 1865912
+	store u32 1865960 #0
+	load u32 #0 1865916
+	store u32 1865964 #0
+	load u32 #0 1865920
+	store u32 1865968 #0
+	movi u32 #0 0
+	store u32 1865972 #0
+dt_loop:
+	load u32 #0 1865972
+	load u32 #1 1865964
+	cmp u32 #0 #1
+	jge dt_done
+
+	load u32 #2 1865960
+	add u32 #2 #0
+	loadr u8 #3 #2
+
+	load u32 #4 1865952
+	mov #5 #0
+	movi u32 #6 8
+	mul u32 #5 #6
+	add u32 #4 #5
+	store u32 1865904 #4
+
+	load u32 #4 1865956
+	store u32 1865908 #4
+	store u32 1865912 #3
+	load u32 #4 1865968
+	store u32 1865916 #4
+	call draw_char
+
+	load u32 #0 1865972
+	inc u32 #0
+	store u32 1865972 #0
+	jmp dt_loop
+dt_done:
+	ret
+
+// ============================================================================
+// init_buffers: cursor sprite + all flat-color chrome fill buffers, once
+// ============================================================================
+init_buffers:
+%include "cursor_fill.quartz"
+
+	// TOPBAR_FILL: 640x24 navy
+	movi u32 #0 1376896
+	store u32 1865904 #0
+	movi u32 #0 640
+	store u32 1865908 #0
+	movi u32 #0 24
+	store u32 1865912 #0
+	movi u32 #0 0xFF800000
+	store u32 1865916 #0
+	call fill_rect
+
+	// WIN_TITLEBAR_FILL: 300x26 navy, slightly transparent (alpha 0xE0)
+	movi u32 #0 1438336
+	store u32 1865904 #0
+	movi u32 #0 300
+	store u32 1865908 #0
+	movi u32 #0 26
+	store u32 1865912 #0
+	movi u32 #0 0xE0800000
+	store u32 1865916 #0
+	call fill_rect
+
+	// WIN_BODY_FILL: 300x194 white, slightly transparent (alpha 0xE0)
+	movi u32 #0 1469536
+	store u32 1865904 #0
+	movi u32 #0 300
+	store u32 1865908 #0
+	movi u32 #0 194
+	store u32 1865912 #0
+	movi u32 #0 0xE0FFFFFF
+	store u32 1865916 #0
+	call fill_rect
+
+	// CLOSEBOX_FILL: 18x18 light gray (opaque)
+	movi u32 #0 1702336
+	store u32 1865904 #0
+	movi u32 #0 18
+	store u32 1865908 #0
+	movi u32 #0 18
+	store u32 1865912 #0
+	movi u32 #0 0xFFC0C0C0
+	store u32 1865916 #0
+	call fill_rect
+
+	// MSGBOX_FILL: 260x110 light gray (About box)
+	movi u32 #0 1703632
+	store u32 1865904 #0
+	movi u32 #0 260
+	store u32 1865908 #0
+	movi u32 #0 110
+	store u32 1865912 #0
+	movi u32 #0 0xFFC0C0C0
+	store u32 1865916 #0
+	call fill_rect
+
+	// BUTTON_FILL: 80x24 light gray (About's OK button)
+	movi u32 #0 1818032
+	store u32 1865904 #0
+	movi u32 #0 80
+	store u32 1865908 #0
+	movi u32 #0 24
+	store u32 1865912 #0
+	movi u32 #0 0xFFC0C0C0
+	store u32 1865916 #0
+	call fill_rect
+
+	// CALCBTN_FILL: 65x32 light gray (opaque - calculator keys)
+	movi u32 #0 1825712
+	store u32 1865904 #0
+	movi u32 #0 65
+	store u32 1865908 #0
+	movi u32 #0 32
+	store u32 1865912 #0
+	movi u32 #0 0xFFC0C0C0
+	store u32 1865916 #0
+	call fill_rect
+
+	// DISPLAY_FILL: 284x28 white (opaque - calculator display)
+	movi u32 #0 1834032
+	store u32 1865904 #0
+	movi u32 #0 284
+	store u32 1865908 #0
+	movi u32 #0 28
+	store u32 1865912 #0
+	movi u32 #0 0xFFFFFFFF
+	store u32 1865916 #0
+	call fill_rect
+
+	// BTN_CHARS table (row-major, 4x4):
+	//   7 8 9 /
+	//   4 5 6 *
+	//   1 2 3 -
+	//   0 C = +
+	movi u32 #0 1866104
+	movi u32 #1 55
+	storer u8 #0 #1
+	movi u32 #0 1866104
+	addi u32 #0 1
+	movi u32 #1 56
+	storer u8 #0 #1
+	movi u32 #0 1866104
+	addi u32 #0 2
+	movi u32 #1 57
+	storer u8 #0 #1
+	movi u32 #0 1866104
+	addi u32 #0 3
+	movi u32 #1 47
+	storer u8 #0 #1
+
+	movi u32 #0 1866104
+	addi u32 #0 4
+	movi u32 #1 52
+	storer u8 #0 #1
+	movi u32 #0 1866104
+	addi u32 #0 5
+	movi u32 #1 53
+	storer u8 #0 #1
+	movi u32 #0 1866104
+	addi u32 #0 6
+	movi u32 #1 54
+	storer u8 #0 #1
+	movi u32 #0 1866104
+	addi u32 #0 7
+	movi u32 #1 42
+	storer u8 #0 #1
+
+	movi u32 #0 1866104
+	addi u32 #0 8
+	movi u32 #1 49
+	storer u8 #0 #1
+	movi u32 #0 1866104
+	addi u32 #0 9
+	movi u32 #1 50
+	storer u8 #0 #1
+	movi u32 #0 1866104
+	addi u32 #0 10
+	movi u32 #1 51
+	storer u8 #0 #1
+	movi u32 #0 1866104
+	addi u32 #0 11
+	movi u32 #1 45
+	storer u8 #0 #1
+
+	movi u32 #0 1866104
+	addi u32 #0 12
+	movi u32 #1 48
+	storer u8 #0 #1
+	movi u32 #0 1866104
+	addi u32 #0 13
+	movi u32 #1 67
+	storer u8 #0 #1
+	movi u32 #0 1866104
+	addi u32 #0 14
+	movi u32 #1 61
+	storer u8 #0 #1
+	movi u32 #0 1866104
+	addi u32 #0 15
+	movi u32 #1 43
+	storer u8 #0 #1
+
+	ret
+
+// ============================================================================
+// draw_topbar
+// ============================================================================
+draw_topbar:
+	movi u16 #0 0
+	movi u16 #1 0
+	movi u16 #2 640
+	movi u16 #3 24
+	movi u32 #4 1376896
+	movi u32 #5 $std.BUS_DEV_VIDEO
+	movi u32 #6 $std.VIDEO_PORT_X
+	busout #5 #6 #0
+	movi u32 #6 $std.VIDEO_PORT_Y
+	busout #5 #6 #1
+	movi u32 #6 $std.VIDEO_PORT_W
+	busout #5 #6 #2
+	movi u32 #6 $std.VIDEO_PORT_H
+	busout #5 #6 #3
+	movi u32 #6 $std.VIDEO_CMD_FRAME
+	movi u32 #7 61440
+	busoutb #5 #6 #4 #7 #8
+
+	movi u32 #0 8
+	store u32 1865904 #0
+	movi u32 #0 5
+	store u32 1865908 #0
+	movi u32 #0 1322112
+	store u32 1865912 #0
+	movi u32 #0 21
+	store u32 1865916 #0
+	movi u32 #0 8192
+	store u32 1865920 #0
+	call draw_text
+
+	// close ("X") box
+	movi u16 #0 618
+	movi u16 #1 3
+	movi u16 #2 18
+	movi u16 #3 18
+	movi u32 #4 1702336
+	movi u32 #5 $std.BUS_DEV_VIDEO
+	movi u32 #6 $std.VIDEO_PORT_X
+	busout #5 #6 #0
+	movi u32 #6 $std.VIDEO_PORT_Y
+	busout #5 #6 #1
+	movi u32 #6 $std.VIDEO_PORT_W
+	busout #5 #6 #2
+	movi u32 #6 $std.VIDEO_PORT_H
+	busout #5 #6 #3
+	movi u32 #6 $std.VIDEO_CMD_FRAME
+	movi u32 #7 1296
+	busoutb #5 #6 #4 #7 #8
+
+	movi u32 #0 618
+	store u32 1865904 #0
+	movi u32 #0 3
+	store u32 1865908 #0
+	movi u32 #0 18
+	store u32 1865912 #0
+	movi u32 #0 18
+	store u32 1865916 #0
+	movi u32 #0 0xFF808080
+	store u32 1865920 #0
+	call draw_border
+
+	movi u32 #0 623
+	store u32 1865904 #0
+	movi u32 #0 5
+	store u32 1865908 #0
+	movi u32 #0 88
+	store u32 1865912 #0
+	movi u32 #0 50752
+	store u32 1865916 #0
+	call draw_char
+
+	// "?" (About) box
+	movi u16 #0 596
+	movi u16 #1 3
+	movi u16 #2 18
+	movi u16 #3 18
+	movi u32 #4 1702336
+	movi u32 #5 $std.BUS_DEV_VIDEO
+	movi u32 #6 $std.VIDEO_PORT_X
+	busout #5 #6 #0
+	movi u32 #6 $std.VIDEO_PORT_Y
+	busout #5 #6 #1
+	movi u32 #6 $std.VIDEO_PORT_W
+	busout #5 #6 #2
+	movi u32 #6 $std.VIDEO_PORT_H
+	busout #5 #6 #3
+	movi u32 #6 $std.VIDEO_CMD_FRAME
+	movi u32 #7 1296
+	busoutb #5 #6 #4 #7 #8
+
+	movi u32 #0 596
+	store u32 1865904 #0
+	movi u32 #0 3
+	store u32 1865908 #0
+	movi u32 #0 18
+	store u32 1865912 #0
+	movi u32 #0 18
+	store u32 1865916 #0
+	movi u32 #0 0xFF808080
+	store u32 1865920 #0
+	call draw_border
+
+	movi u32 #0 601
+	store u32 1865904 #0
+	movi u32 #0 5
+	store u32 1865908 #0
+	movi u32 #0 63
+	store u32 1865912 #0
+	movi u32 #0 50752
+	store u32 1865916 #0
+	call draw_char
+	ret
+
+// ============================================================================
+// draw_about
+// ============================================================================
+draw_about:
+	movi u16 #0 190
+	movi u16 #1 185
+	movi u16 #2 260
+	movi u16 #3 110
+	movi u32 #4 1703632
+	movi u32 #5 $std.BUS_DEV_VIDEO
+	movi u32 #6 $std.VIDEO_PORT_X
+	busout #5 #6 #0
+	movi u32 #6 $std.VIDEO_PORT_Y
+	busout #5 #6 #1
+	movi u32 #6 $std.VIDEO_PORT_W
+	busout #5 #6 #2
+	movi u32 #6 $std.VIDEO_PORT_H
+	busout #5 #6 #3
+	movi u32 #6 $std.VIDEO_CMD_FRAME
+	movi u32 #7 114400
+	busoutb #5 #6 #4 #7 #8
+
+	movi u32 #0 190
+	store u32 1865904 #0
+	movi u32 #0 185
+	store u32 1865908 #0
+	movi u32 #0 260
+	store u32 1865912 #0
+	movi u32 #0 110
+	store u32 1865916 #0
+	movi u32 #0 0xFF808080
+	store u32 1865920 #0
+	call draw_border
+
+	movi u32 #0 268
+	store u32 1865904 #0
+	movi u32 #0 215
+	store u32 1865908 #0
+	movi u32 #0 1322133
+	store u32 1865912 #0
+	movi u32 #0 13
+	store u32 1865916 #0
+	movi u32 #0 50752
+	store u32 1865920 #0
+	call draw_text
+
+	movi u16 #0 280
+	movi u16 #1 256
+	movi u16 #2 80
+	movi u16 #3 24
+	movi u32 #4 1818032
+	movi u32 #5 $std.BUS_DEV_VIDEO
+	movi u32 #6 $std.VIDEO_PORT_X
+	busout #5 #6 #0
+	movi u32 #6 $std.VIDEO_PORT_Y
+	busout #5 #6 #1
+	movi u32 #6 $std.VIDEO_PORT_W
+	busout #5 #6 #2
+	movi u32 #6 $std.VIDEO_PORT_H
+	busout #5 #6 #3
+	movi u32 #6 $std.VIDEO_CMD_FRAME
+	movi u32 #7 7680
+	busoutb #5 #6 #4 #7 #8
+
+	movi u32 #0 280
+	store u32 1865904 #0
+	movi u32 #0 256
+	store u32 1865908 #0
+	movi u32 #0 80
+	store u32 1865912 #0
+	movi u32 #0 24
+	store u32 1865916 #0
+	movi u32 #0 0xFF808080
+	store u32 1865920 #0
+	call draw_border
+
+	movi u32 #0 312
+	store u32 1865904 #0
+	movi u32 #0 261
+	store u32 1865908 #0
+	movi u32 #0 1322146
+	store u32 1865912 #0
+	movi u32 #0 2
+	store u32 1865916 #0
+	movi u32 #0 50752
+	store u32 1865920 #0
+	call draw_text
+	ret
+
+// ============================================================================
+// draw_calc_window
+// ============================================================================
+draw_calc_window:
+	load u32 #0 1865876
+	load u32 #1 1865880
+
+	// title bar
+	movi u16 #2 300
+	movi u16 #3 26
+	movi u32 #4 1438336
+	movi u32 #5 $std.BUS_DEV_VIDEO
+	movi u32 #6 $std.VIDEO_PORT_X
+	busout #5 #6 #0
+	movi u32 #6 $std.VIDEO_PORT_Y
+	busout #5 #6 #1
+	movi u32 #6 $std.VIDEO_PORT_W
+	busout #5 #6 #2
+	movi u32 #6 $std.VIDEO_PORT_H
+	busout #5 #6 #3
+	movi u32 #6 $std.VIDEO_CMD_FRAME
+	movi u32 #7 31200
+	busoutb #5 #6 #4 #7 #8
+
+	// body
+	load u32 #0 1865876
+	load u32 #1 1865880
+	addi u32 #1 26
+	movi u16 #2 300
+	movi u16 #3 194
+	movi u32 #4 1469536
+	movi u32 #5 $std.BUS_DEV_VIDEO
+	movi u32 #6 $std.VIDEO_PORT_X
+	busout #5 #6 #0
+	movi u32 #6 $std.VIDEO_PORT_Y
+	busout #5 #6 #1
+	movi u32 #6 $std.VIDEO_PORT_W
+	busout #5 #6 #2
+	movi u32 #6 $std.VIDEO_PORT_H
+	busout #5 #6 #3
+	movi u32 #6 $std.VIDEO_CMD_FRAME
+	movi u32 #7 232800
+	busoutb #5 #6 #4 #7 #8
+
+	// outer border
+	load u32 #0 1865876
+	store u32 1865904 #0
+	load u32 #0 1865880
+	store u32 1865908 #0
+	movi u32 #0 300
+	store u32 1865912 #0
+	movi u32 #0 220
+	store u32 1865916 #0
+	movi u32 #0 0xFF404040
+	store u32 1865920 #0
+	call draw_border
+
+	// close box
+	load u32 #0 1865876
+	addi u32 #0 278
+	store u32 1866064 #0
+	load u32 #0 1866064
+	load u32 #1 1865880
+	addi u32 #1 4
+	movi u16 #2 18
+	movi u16 #3 18
+	movi u32 #4 1702336
+	movi u32 #5 $std.BUS_DEV_VIDEO
+	movi u32 #6 $std.VIDEO_PORT_X
+	busout #5 #6 #0
+	movi u32 #6 $std.VIDEO_PORT_Y
+	busout #5 #6 #1
+	movi u32 #6 $std.VIDEO_PORT_W
+	busout #5 #6 #2
+	movi u32 #6 $std.VIDEO_PORT_H
+	busout #5 #6 #3
+	movi u32 #6 $std.VIDEO_CMD_FRAME
+	movi u32 #7 1296
+	busoutb #5 #6 #4 #7 #8
+
+	load u32 #0 1866064
+	store u32 1865904 #0
+	load u32 #0 1865880
+	addi u32 #0 4
+	store u32 1865908 #0
+	movi u32 #0 18
+	store u32 1865912 #0
+	movi u32 #0 18
+	store u32 1865916 #0
+	movi u32 #0 0xFF404040
+	store u32 1865920 #0
+	call draw_border
+
+	load u32 #0 1866064
+	addi u32 #0 5
+	store u32 1865904 #0
+	load u32 #0 1865880
+	addi u32 #0 6
+	store u32 1865908 #0
+	movi u32 #0 88
+	store u32 1865912 #0
+	movi u32 #0 50752
+	store u32 1865916 #0
+	call draw_char
+
+	// title text "Calculator"
+	load u32 #0 1865876
+	addi u32 #0 8
+	store u32 1865904 #0
+	load u32 #0 1865880
+	addi u32 #0 6
+	store u32 1865908 #0
+	movi u32 #0 1322148
+	store u32 1865912 #0
+	movi u32 #0 10
+	store u32 1865916 #0
+	movi u32 #0 8192
+	store u32 1865920 #0
+	call draw_text
+
+	// display
+	load u32 #0 1865876
+	addi u32 #0 8
+	load u32 #1 1865880
+	addi u32 #1 30
+	movi u16 #2 284
+	movi u16 #3 28
+	movi u32 #4 1834032
+	movi u32 #5 $std.BUS_DEV_VIDEO
+	movi u32 #6 $std.VIDEO_PORT_X
+	busout #5 #6 #0
+	movi u32 #6 $std.VIDEO_PORT_Y
+	busout #5 #6 #1
+	movi u32 #6 $std.VIDEO_PORT_W
+	busout #5 #6 #2
+	movi u32 #6 $std.VIDEO_PORT_H
+	busout #5 #6 #3
+	movi u32 #6 $std.VIDEO_CMD_FRAME
+	movi u32 #7 31808
+	busoutb #5 #6 #4 #7 #8
+
+	load u32 #0 1865876
+	addi u32 #0 8
+	store u32 1865904 #0
+	load u32 #0 1865880
+	addi u32 #0 30
+	store u32 1865908 #0
+	movi u32 #0 284
+	store u32 1865912 #0
+	movi u32 #0 28
+	store u32 1865916 #0
+	movi u32 #0 0xFF808080
+	store u32 1865920 #0
+	call draw_border
+
+	call calc_format_display
+	// right-align the text within the display box (284px wide, 8px/char)
+	load u32 #0 1865944
+	mov #1 #0
+	movi u32 #2 8
+	mul u32 #1 #2
+	movi u32 #3 276
+	sub u32 #3 #1
+	load u32 #4 1865876
+	add u32 #3 #4
+	store u32 1865904 #3
+	load u32 #4 1865880
+	addi u32 #4 37
+	store u32 1865908 #4
+	movi u32 #4 1866136
+	store u32 1865912 #4
+	store u32 1865916 #0
+	movi u32 #4 50752
+	store u32 1865920 #4
+	call draw_text
+
+	// button grid
+	movi u32 #0 0
+dcw_btn_loop:
+	cmpi u32 #0 16
+	jge dcw_btn_done
+	store u32 1866068 #0
+
+	mov #1 #0
+	movi u32 #2 4
+	div u32 #1 #2         // row = i/4
+	mov #3 #0
+	mod u32 #3 #2         // col = i%4
+
+	// relX = 8 + col*71 ; relY = 64 + row*38
+	mov #4 #3
+	movi u32 #5 71
+	mul u32 #4 #5
+	addi u32 #4 8
+	mov #6 #1
+	movi u32 #7 38
+	mul u32 #6 #7
+	addi u32 #6 64
+
+	load u32 #8 1865876
+	add u32 #8 #4
+	store u32 1866072 #8         // abs x
+	load u32 #9 1865880
+	add u32 #9 #6
+	store u32 1866076 #9         // abs y
+
+	load u32 #0 1866072
+	load u32 #1 1866076
+	movi u16 #2 65
+	movi u16 #3 32
+	movi u32 #4 1825712
+	movi u32 #5 $std.BUS_DEV_VIDEO
+	movi u32 #6 $std.VIDEO_PORT_X
+	busout #5 #6 #0
+	movi u32 #6 $std.VIDEO_PORT_Y
+	busout #5 #6 #1
+	movi u32 #6 $std.VIDEO_PORT_W
+	busout #5 #6 #2
+	movi u32 #6 $std.VIDEO_PORT_H
+	busout #5 #6 #3
+	movi u32 #6 $std.VIDEO_CMD_FRAME
+	movi u32 #7 8320
+	busoutb #5 #6 #4 #7 #8
+
+	load u32 #0 1866072
+	store u32 1865904 #0
+	load u32 #0 1866076
+	store u32 1865908 #0
+	movi u32 #0 65
+	store u32 1865912 #0
+	movi u32 #0 32
+	store u32 1865916 #0
+	movi u32 #0 0xFF808080
+	store u32 1865920 #0
+	call draw_border
+
+	movi u32 #0 1866104
+	load u32 #1 1866068
+	add u32 #0 #1
+	loadr u8 #2 #0
+
+	load u32 #0 1866072
+	addi u32 #0 28
+	store u32 1865904 #0
+	load u32 #0 1866076
+	addi u32 #0 9
+	store u32 1865908 #0
+	store u32 1865912 #2
+	movi u32 #0 50752
+	store u32 1865916 #0
+	call draw_char
+
+	load u32 #0 1866068
+	inc u32 #0
+	jmp dcw_btn_loop
+dcw_btn_done:
+	ret
+
+// ============================================================================
+// itoa (P0 = value as i32, P1 = out_addr) -> R0 = length written (no NUL)
+// ============================================================================
+itoa:
+	load i32 #0 1865904
+	load u32 #1 1865908
+	movi u32 #2 0
+
+	cmpi i32 #0 0
+	jge it_nonneg
+	movi u32 #2 1
+	movi i32 #3 0
+	sub i32 #3 #0
+	mov #0 #3
+it_nonneg:
+	cmpi u32 #0 0
+	jnz it_extract
+	movi u32 #3 48
+	storer u8 #1 #3
+	movi u32 #4 1
+	store u32 1865944 #4
+	ret
+
+it_extract:
+	movi u32 #5 0
+	movi u32 #6 1866120
+it_extract_loop:
+	cmpi u32 #0 0
+	jz it_extract_done
+	mov #7 #0
+	movi u32 #8 10
+	mod u32 #7 #8
+	addi u32 #7 48
+	mov #9 #6
+	add u32 #9 #5
+	storer u8 #9 #7
+	inc u32 #5
+	movi u32 #8 10
+	div u32 #0 #8
+	jmp it_extract_loop
+it_extract_done:
+	movi u32 #10 0
+	cmpi u32 #2 0
+	jz it_no_sign
+	movi u32 #11 45
+	mov #12 #1
+	storer u8 #12 #11
+	movi u32 #10 1
+it_no_sign:
+	mov #13 #5
+it_copy_loop:
+	cmpi u32 #13 0
+	jz it_copy_done
+	subi u32 #13 1
+	mov #14 #6
+	add u32 #14 #13
+	loadr u8 #15 #14
+	mov #14 #1
+	add u32 #14 #10
+	storer u8 #14 #15
+	inc u32 #10
+	jmp it_copy_loop
+it_copy_done:
+	store u32 1865944 #10
+	ret
+
+// ============================================================================
+// calc_format_display -> writes the text to show into DISPLAY_BUF,
+// R0 = its length. Shows "Err" while CALC_ERROR is set.
+// ============================================================================
+calc_format_display:
+	load u32 #0 1865896
+	cmpi u32 #0 0
+	jz cfd_normal
+
+	movi u32 #0 1866136
+	movi u32 #1 69
+	storer u8 #0 #1
+	movi u32 #0 1866136
+	addi u32 #0 1
+	movi u32 #1 114
+	storer u8 #0 #1
+	movi u32 #0 1866136
+	addi u32 #0 2
+	movi u32 #1 114
+	storer u8 #0 #1
+	movi u32 #4 3
+	store u32 1865944 #4
+	ret
+
+cfd_normal:
+	load i32 #0 1865888
+	store u32 1865904 #0
+	movi u32 #0 1866136
+	store u32 1865908 #0
+	call itoa
+	ret
+
+// ============================================================================
+// calc_apply (P0=acc i32, P1=op u32, P2=cur i32) -> R0=result, R1=error(0/1)
+// ============================================================================
+calc_apply:
+	load i32 #0 1865904
+	load u32 #1 1865908
+	load i32 #2 1865912
+
+	cmpi u32 #1 1
+	jz ca_add
+	cmpi u32 #1 2
+	jz ca_sub
+	cmpi u32 #1 3
+	jz ca_mul
+	cmpi u32 #1 4
+	jz ca_div
+
+	store u32 1865944 #0
+	movi u32 #3 0
+	store u32 1865948 #3
+	ret
+
+ca_add:
+	add i32 #0 #2
+	jmp ca_ok
+ca_sub:
+	sub i32 #0 #2
+	jmp ca_ok
+ca_mul:
+	mul i32 #0 #2
+	jmp ca_ok
+ca_div:
+	cmpi i32 #2 0
+	jnz ca_div_ok
+	movi u32 #3 1
+	store u32 1865948 #3
+	movi u32 #4 0
+	store u32 1865944 #4
+	ret
+ca_div_ok:
+	div i32 #0 #2
+ca_ok:
+	store u32 1865944 #0
+	movi u32 #3 0
+	store u32 1865948 #3
+	ret
+
+// ============================================================================
+// calc_press: dispatches on HC_CHARCODE (the key that was just clicked)
+// ============================================================================
+calc_press:
+	load u32 #0 1866048
+
+	load u32 #1 1865896
+	cmpi u32 #1 0
+	jz cp_not_error
+	// while showing an error, only "C" (67) does anything
+	cmpi u32 #0 67
+	jz cp_clear
+	ret
+cp_not_error:
+
+	cmpi u32 #0 48
+	jl cp_check_c
+	cmpi u32 #0 57
+	jg cp_check_c
+	// it's a digit
+	subi u32 #0 48
+	store u32 1866060 #0
+
+	load u32 #1 1865900
+	cmpi u32 #1 0
+	jz cp_digit_append
+	movi u32 #2 0
+	store u32 1865888 #2
+	store u32 1865900 #2
+cp_digit_append:
+	load i32 #1 1865888
+	cmpi i32 #1 99999
+	jg cp_ret
+	movi u32 #2 10
+	mul i32 #1 #2
+	load u32 #3 1866060
+	add i32 #1 #3
+	store u32 1865888 #1
+	ret
+
+cp_check_c:
+	cmpi u32 #0 67
+	jnz cp_check_eq
+cp_clear:
+	movi u32 #1 0
+	store u32 1865884 #1
+	store u32 1865888 #1
+	store u32 1865892 #1
+	store u32 1865896 #1
+	store u32 1865900 #1
+	ret
+
+cp_check_eq:
+	cmpi u32 #0 61
+	jnz cp_check_op
+	load u32 #1 1865892
+	cmpi u32 #1 0
+	jz cp_ret
+	load i32 #2 1865884
+	store u32 1865904 #2
+	store u32 1865908 #1
+	load i32 #2 1865888
+	store u32 1865912 #2
+	call calc_apply
+	load u32 #3 1865948
+	cmpi u32 #3 1
+	jnz cp_eq_ok
+	movi u32 #4 1
+	store u32 1865896 #4
+	movi u32 #4 0
+	store u32 1865884 #4
+	store u32 1865888 #4
+	store u32 1865892 #4
+	ret
+cp_eq_ok:
+	load u32 #4 1865944
+	store u32 1865884 #4
+	store u32 1865888 #4
+	movi u32 #4 0
+	store u32 1865892 #4
+	movi u32 #4 1
+	store u32 1865900 #4
+	ret
+
+cp_check_op:
+	// map the key to an operator code: + - * /
+	movi u32 #1 0
+	cmpi u32 #0 43
+	jnz cp_op_try_minus
+	movi u32 #1 1
+	jmp cp_op_known
+cp_op_try_minus:
+	cmpi u32 #0 45
+	jnz cp_op_try_mul
+	movi u32 #1 2
+	jmp cp_op_known
+cp_op_try_mul:
+	cmpi u32 #0 42
+	jnz cp_op_try_div
+	movi u32 #1 3
+	jmp cp_op_known
+cp_op_try_div:
+	cmpi u32 #0 47
+	jnz cp_ret
+	movi u32 #1 4
+cp_op_known:
+	store u32 1866060 #1
+
+	load u32 #2 1865892
+	cmpi u32 #2 0
+	jz cp_op_first
+
+	// a previous op is pending -> fold it in first
+	load i32 #3 1865884
+	store u32 1865904 #3
+	store u32 1865908 #2
+	load i32 #3 1865888
+	store u32 1865912 #3
+	call calc_apply
+	load u32 #4 1865948
+	cmpi u32 #4 1
+	jnz cp_op_fold_ok
+	movi u32 #5 1
+	store u32 1865896 #5
+	movi u32 #5 0
+	store u32 1865884 #5
+	store u32 1865888 #5
+	store u32 1865892 #5
+	ret
+cp_op_fold_ok:
+	load u32 #5 1865944
+	store u32 1865884 #5
+	jmp cp_op_set
+
+cp_op_first:
+	load i32 #3 1865888
+	store u32 1865884 #3
+
+cp_op_set:
+	load u32 #1 1866060
+	store u32 1865892 #1
+	movi u32 #1 1
+	store u32 1865900 #1
+cp_ret:
+	ret
+

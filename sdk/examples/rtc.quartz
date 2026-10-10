@@ -1,0 +1,14 @@
+%include "std.quartz"
+
+movi u32 #1 $std.BUS_DEV_RTC
+movi u32 #2 $std.RTC_PORT_MINUTE
+busin #1 #2 #0
+
+debug u32 #0
+
+movi u32 #2 $std.RTC_PORT_DAY
+busin #1 #2 #0
+
+debug u32 #0
+
+halt

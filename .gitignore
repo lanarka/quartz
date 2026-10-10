@@ -1,0 +1,8 @@
+build/
+dist/
+sdk/qasm/quartz/__pycache__/
+sdk/qdebug2/qd2/__pycache__/
+sdk/meteor/__pycache__/
+*.img
+*.raw
+*.obj

@@ -1,0 +1,72 @@
+
+%include "std.quartz"
+
+// Registers:
+// #0 = animated frame X position (0..640, step 4)
+// #1 = scratch: pixel color / OUT value
+// #2 = dev   (always BUS_DEV_VIDEO here)
+// #3 = port  (reloaded before each bus call)
+// #4 = val   (reloaded before each bus OUT)
+// #5 = addr  of the 4x4 RGBA8888 source rect in RAM
+// #6 = len   of that rect in bytes (w*h*4)
+// #7 = dst   receives OUTB's transferred-byte count
+
+movi u32 #5 0x001000
+movi u16 #0 0
+movi u32 #1 0xFF0000FF // ABGR A=FF B=00 G=00 R=FF
+store u32 0x001000 #1
+store u32 0x001004 #1
+store u32 0x001008 #1
+store u32 0x00100c #1
+store u32 0x001010 #1
+store u32 0x001014 #1
+store u32 0x001018 #1
+store u32 0x00101c #1
+store u32 0x001020 #1
+store u32 0x001024 #1
+store u32 0x001028 #1
+store u32 0x00102c #1
+store u32 0x001030 #1
+store u32 0x001034 #1
+store u32 0x001038 #1
+store u32 0x00103c #1
+
+movi u32 #2 $std.BUS_DEV_VIDEO
+movi u32 #6 64 // w*h*4 = 4*4*4
+
+// y, w and h never change for the life of the program, so stage them once;
+// staged registers are per-VM state and persist until OP_BUS_RESET.
+movi u32 #3 $std.VIDEO_PORT_Y
+movi u32 #4 40
+busout #2 #3 #4
+
+movi u32 #3 $std.VIDEO_PORT_W
+movi u32 #4 4
+busout #2 #3 #4
+
+movi u32 #3 $std.VIDEO_PORT_H
+movi u32 #4 4
+busout #2 #3 #4
+
+loop:
+	// stage x, then trigger the blit
+	movi u32 #3 $std.VIDEO_PORT_X
+	busout #2 #3 #0
+
+	movi u32 #3 $std.VIDEO_CMD_FRAME
+	busoutb #2 #3 #5 #6 #7
+
+	movi u32 #3 $std.VIDEO_CMD_VSYNC
+	movi u32 #4 0
+	busout #2 #3 #4
+
+	//inc u16 #0
+	addi u16 #0 4 // 12
+
+	cmpi u16 #0 640
+	jge reset
+	jmp loop
+
+reset:
+	movi u16 #0 0
+	jmp loop

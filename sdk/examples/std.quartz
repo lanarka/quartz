@@ -1,0 +1,104 @@
+// VIDEO
+%define BUS_DEV_VIDEO            0
+
+%define VIDEO_PORT_WIDTH         0
+%define VIDEO_PORT_HEIGHT        1
+%define VIDEO_PORT_X             2
+%define VIDEO_PORT_Y             3
+%define VIDEO_PORT_W             4
+%define VIDEO_PORT_H             5
+%define VIDEO_PORT_OFFSET        6
+
+%define VIDEO_CMD_PIX            7
+%define VIDEO_CMD_CLEAR          8
+%define VIDEO_CMD_CLEARC         9
+%define VIDEO_CMD_VSYNC         10
+%define VIDEO_CMD_FRAME         11
+%define VIDEO_CMD_RAW           12
+
+
+
+// VIDEO TEXT
+%define BUS_DEV_VIDEO_TEXT       1
+
+%define VTXT_PORT_COLS           0
+%define VTXT_PORT_ROWS           1
+%define VTXT_PORT_X              2
+%define VTXT_PORT_Y              3
+%define VTXT_PORT_W              4
+%define VTXT_PORT_H              5
+%define VTXT_PORT_CODEPOINT      6
+%define VTXT_PORT_FG             7
+%define VTXT_PORT_BG             8
+%define VTXT_PORT_CURSOR_X       9
+%define VTXT_PORT_CURSOR_Y      10
+
+%define VTXT_CMD_CHAR           11
+%define VTXT_CMD_CLEAR          12
+%define VTXT_CMD_CURSET         13
+%define VTXT_CMD_CURENA         14
+%define VTXT_CMD_FRAME          15
+
+
+
+// KEYBOARD
+%define BUS_DEV_KEYBOARD         2
+
+%define KBD_PORT_POLL            0
+
+
+
+// MOUSE
+%define BUS_DEV_MOUSE            3
+
+%define MOUSE_PORT_MODE          0
+%define MOUSE_PORT_X             1
+%define MOUSE_PORT_Y             2
+%define MOUSE_PORT_BUTTONS       3
+
+
+
+// AUDIO
+%define BUS_DEV_AUDIO            4
+
+%define AUDIO_PORT_PLAY          0
+
+
+
+// DISK
+%define BUS_DEV_DISK0            5
+%define BUS_DEV_DISK1            6
+
+%define DISK_PORT_LBA            0
+%define DISK_PORT_SECTOR_SIZE    1
+%define DISK_PORT_SECTOR_COUNT   2
+%define DISK_PORT_STATUS         3
+
+%define DISK_CMD_READ            4
+%define DISK_CMD_WRITE           5
+
+
+
+// NET
+%define BUS_DEV_NETWORK          7
+
+%define NET_PORT_MAXPACKET       0
+%define NET_PORT_POLL            1
+%define NET_PORT_STATUS          2
+
+%define NET_CMD_SEND             3
+%define NET_CMD_RECV             4
+
+
+// RTC
+%define BUS_DEV_RTC              8
+
+%define RTC_PORT_YEAR            0
+%define RTC_PORT_MONTH           1
+%define RTC_PORT_DAY             2
+%define RTC_PORT_HOUR            3
+%define RTC_PORT_MINUTE          4
+%define RTC_PORT_SECOND          5
+%define RTC_PORT_WEEKDAY         6
+%define RTC_PORT_MILLISECOND     7
+%define RTC_PORT_EPOCH           8

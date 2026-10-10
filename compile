@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+
+if [ -d "build/" ]; then
+    cd build
+	make
+	cd ..
+else
+	mkdir build
+	cd build
+	cmake ..
+	cd ..
+	./compile
+fi

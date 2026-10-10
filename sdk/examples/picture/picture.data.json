@@ -1,0 +1,7 @@
+{
+	"start": "0x00",
+	"blobs": [
+		{"Image1": {"from_file": "sdk/examples/picture/assets/picture2.raw"}},
+		{"Image2": {"from_file": "sdk/examples/picture/assets/picture1.raw"}}
+	]
+}

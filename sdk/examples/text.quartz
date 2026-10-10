@@ -1,0 +1,44 @@
+%include "std.quartz"
+
+// #10 bus_dev, #11 bus_port (reused for every bus call below)
+
+movi i32 #9 5000000
+
+loop:
+	rnd #0 80 // 30
+	rnd #1 30 // 80
+	rnd #2 748 // glyphs
+
+	rnd #3 0x00ffffff
+	addi u32 #3 0xff000000
+
+	rnd #4 0x00ffffff
+	addi u32 #4 0xff000000
+
+	movi u32 #10 $std.BUS_DEV_VIDEO_TEXT
+	movi u32 #11 $std.VTXT_PORT_X
+	busout #10 #11 #0
+	movi u32 #11 $std.VTXT_PORT_Y
+	busout #10 #11 #1
+	movi u32 #11 $std.VTXT_PORT_CODEPOINT
+	busout #10 #11 #2
+	movi u32 #11 $std.VTXT_PORT_FG
+	busout #10 #11 #3
+	movi u32 #11 $std.VTXT_PORT_BG
+	busout #10 #11 #4
+	movi u32 #11 $std.VTXT_CMD_CHAR
+	busout #10 #11 #11
+
+	movi u32 #10 $std.BUS_DEV_VIDEO
+	movi u32 #11 $std.VIDEO_CMD_VSYNC
+	busout #10 #11 #11
+	jmp loop
+
+
+	cmpi i32 #9 0
+	jz done
+	dec i32 #9
+	jmp loop
+
+done:
+	halt

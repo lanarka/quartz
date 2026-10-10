@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+
+# Create assets
+python3 scripts/helpers/images/png2bin.py sdk/examples/picture/assets/src/picture1.png sdk/examples/picture/assets/picture1.raw &&
+python3 scripts/helpers/images/png2bin.py sdk/examples/picture/assets/src/picture2.png sdk/examples/picture/assets/picture2.raw &&
+
+# Compile
+python3 sdk/qasm/qasm.py sdk/examples/picture/picture.quartz dist/picture.bin &&
+
+# Run
+./build/quartz dist/picture.bin --ram 8388608

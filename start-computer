@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+
+# Compile program
+python3 sdk/qasm/qasm.py sdk/examples/game.quartz dist/game.bin --raw
+
+# Create bootsector data
+python3 sdk/disktools/bs.py dist/bs.raw dist/game.bin
+
+# Create disk0
+python3 sdk/disktools/disk.py disk0.img --create 256k
+
+# Create disk1
+python3 sdk/disktools/disk.py disk1.img --create 1M
+
+# Add bootsector data to disk
+python3 sdk/disktools/disk.py disk0.img --write 0 dist/bs.raw
+
+# Add program to disk
+python3 sdk/disktools/disk.py disk0.img --write 2 dist/game.bin
+
+# Compile bios
+python3 sdk/qasm/qasm.py sdk/examples/lake.quartz dist/lake.bin
+
+# Run computer
+./build/quartz dist/lake.bin \
+	--ram 8388608 \
+	--dump dist/lake.ram \
+	--disk0 disk0.img \
+	--disk1 disk1.img

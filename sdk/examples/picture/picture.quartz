@@ -1,0 +1,48 @@
+%include "../std.quartz"
+%data "sdk/examples/picture/picture.data.json"
+// Picture1 150x113 @ 0x00000000
+// Picture2 640x480 @ 0x000108d8
+
+// #10 bus_dev, #11 bus_port, #12 bus_len, #13 bus_dst
+
+movi u16 #0 0
+movi u16 #1 0
+movi u16 #2 640
+movi u16 #3 480
+movi u32 #4 0x000108d8
+
+movi u32 #10 $std.BUS_DEV_VIDEO
+movi u32 #11 $std.VIDEO_PORT_X
+busout #10 #11 #0
+movi u32 #11 $std.VIDEO_PORT_Y
+busout #10 #11 #1
+movi u32 #11 $std.VIDEO_PORT_W
+busout #10 #11 #2
+movi u32 #11 $std.VIDEO_PORT_H
+busout #10 #11 #3
+movi u32 #11 $std.VIDEO_CMD_FRAME
+movi u32 #12 1228800       // len = 640*480*4
+busoutb #10 #11 #4 #12 #13
+
+movi u16 #0 0
+movi u16 #1 0
+movi u16 #2 150
+movi u16 #3 113
+movi u32 #4 0x00000000
+
+movi u32 #11 $std.VIDEO_PORT_X
+busout #10 #11 #0
+movi u32 #11 $std.VIDEO_PORT_Y
+busout #10 #11 #1
+movi u32 #11 $std.VIDEO_PORT_W
+busout #10 #11 #2
+movi u32 #11 $std.VIDEO_PORT_H
+busout #10 #11 #3
+movi u32 #11 $std.VIDEO_CMD_FRAME
+movi u32 #12 67800         // len = 150*113*4
+busoutb #10 #11 #4 #12 #13
+
+loop:
+	movi u32 #11 $std.VIDEO_CMD_VSYNC
+	busout #10 #11 #13
+	jmp loop
