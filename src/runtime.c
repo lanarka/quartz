@@ -507,7 +507,7 @@ void rt_mouse(void *rtp, uint16_t *x, uint16_t *y, uint8_t *b) {
     uint8_t btn = 0;
     if (IsMouseButtonDown(MOUSE_BUTTON_LEFT))   btn |= 1;
     if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT))  btn |= 2;
-    if (IsMouseButtonDown(MOUSE_BUTTON_MIDDLE)) btn |= 3;
+    if (IsMouseButtonDown(MOUSE_BUTTON_MIDDLE)) btn |= 4;
     *b = btn;
 }
 
