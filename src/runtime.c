@@ -45,6 +45,12 @@ typedef struct {
     Font font;
     RenderTexture2D target;
     TerminalCell **cells;
+    // What the render texture shows right now. runtime_flush() compares it with `cells` and the cursor and
+    // draws the terminal again only when the picture would really be different - programs that redraw the
+    // same text every frame (or move the cursor to where it already is) then cost nothing here.
+    TerminalCell **shown;
+    int shownCursor;          // 0 = no cursor drawn, otherwise its style (1 block, 2 bar)
+    int shownCursorX, shownCursorY;
     int cursorX, cursorY;
     int cursorVisible;
     double lastCursorBlink;
@@ -78,6 +84,16 @@ static int InitTerminal(Terminal *term, Font font, int cols, int rows, int fontS
             term->cells[y][x].background = BLACK;
         }
     }
+
+    term->shown = (TerminalCell **)calloc((size_t)rows, sizeof(TerminalCell *));
+    if (!term->shown) return 0;
+    for (int y = 0; y < rows; y++) {
+        term->shown[y] = (TerminalCell *)malloc((size_t)cols * sizeof(TerminalCell));
+        if (!term->shown[y]) return 0;
+        // -2 is no character at all: the first flush always draws
+        for (int x = 0; x < cols; x++) term->shown[y][x].character = -2;
+    }
+    term->shownCursor = -1;
     return 1;
 }
 
@@ -86,6 +102,11 @@ static void FreeTerminalBuffers(Terminal *term) {
         for (int y = 0; y < term->rows; y++) free(term->cells[y]);
         free(term->cells);
         term->cells = NULL;
+    }
+    if (term->shown) {
+        for (int y = 0; y < term->rows; y++) free(term->shown[y]);
+        free(term->shown);
+        term->shown = NULL;
     }
     UnloadRenderTexture(term->target);
 }
@@ -106,6 +127,30 @@ static void TerminalCursorEnabled(Terminal *term, int enabled) {
 
 static Vector2 TerminalGetCursor(Terminal *term) {
     return (Vector2){ (float)term->cursorX, (float)term->cursorY };
+}
+
+// the cursor as it is drawn: 0 = invisible (disabled, or in the dark phase of the blink), else the style
+static int TerminalCursorState(const Terminal *term) {
+    return (term->cursorEnabled > 0 && term->cursorVisible) ? term->cursorEnabled : 0;
+}
+
+// 1 when drawing the terminal now would give another picture than the one the render texture shows
+static int TerminalNeedsRender(const Terminal *term) {
+    int cs = TerminalCursorState(term);
+    if (cs != term->shownCursor) return 1;
+    if (cs && (term->cursorX != term->shownCursorX || term->cursorY != term->shownCursorY)) return 1;
+    for (int y = 0; y < term->rows; y++)
+        if (memcmp(term->cells[y], term->shown[y], (size_t)term->cols * sizeof(TerminalCell)) != 0) return 1;
+    return 0;
+}
+
+// remembers what was just drawn
+static void TerminalRemember(Terminal *term) {
+    for (int y = 0; y < term->rows; y++)
+        memcpy(term->shown[y], term->cells[y], (size_t)term->cols * sizeof(TerminalCell));
+    term->shownCursor = TerminalCursorState(term);
+    term->shownCursorX = term->cursorX;
+    term->shownCursorY = term->cursorY;
 }
 
 static void DrawTerminalBuffer(Terminal *term) {
@@ -283,7 +328,9 @@ void runtime_set_scale(RunCtx *rt, float scale) {
 // frame have run. Pushes the CPU-side framebuffer to the GPU texture only if
 // something actually changed (fb_dirty), advances the cursor blink timer,
 // and re-renders the terminal's offscreen texture only if its contents or
-// the cursor's visibility changed (term_changed) - keeping idle frames cheap.
+// the cursor's visibility changed (term_changed) - keeping idle frames cheap. (term_changed is set by every
+// text command, even one that writes what is already on the screen; the terminal is drawn again only when
+// it really differs from the last picture, see TerminalNeedsRender.)
 void runtime_flush(RunCtx *rt) {
     if (rt->fb_dirty) {
         UpdateTexture(rt->gfx_texture, rt->fb);
@@ -296,10 +343,14 @@ void runtime_flush(RunCtx *rt) {
         rt->term_changed = 1;
     }
     if (rt->term_changed) {
-        BeginTextureMode(rt->term.target);
-        ClearBackground(BLACK);
-        DrawTerminalBuffer(&rt->term);
-        EndTextureMode();
+        /// term_changed only says that a text command was executed; it may have written what is already there
+        if (TerminalNeedsRender(&rt->term)) {
+            BeginTextureMode(rt->term.target);
+            ClearBackground(BLACK);
+            DrawTerminalBuffer(&rt->term);
+            EndTextureMode();
+            TerminalRemember(&rt->term);
+        }
         rt->term_changed = 0;
     }
 }
