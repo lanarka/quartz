@@ -169,3 +169,8 @@ On success, the VM prints `Loaded <N> bytes to RAM (data segment @
 0x<addr>)`.
 
 ![Quartz](doc/img/quartz.png)
+
+
+### Related repositories
+
+- Meteor - Programming language for Quartz   [Meteor](https://github.com/lanarka/meteor)
